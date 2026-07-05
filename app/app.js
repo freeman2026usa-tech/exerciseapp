@@ -1,0 +1,1090 @@
+/* app.js —— 健身伴侣工具 · 训练中引导播放器
+ * 状态机：home → warmup → player ⇄ rest → summary
+ * 依赖 program.js（window.PROGRAM）。数据存 localStorage，完全离线自包含。
+ */
+(function () {
+  "use strict";
+
+  const P = window.PROGRAM;
+  const $ = (sel, root) => (root || document).querySelector(sel);
+  const app = $("#app");
+
+  /* ============================ 存储 ============================ */
+  const KEY = "exerciseCompanion.v1";
+  const defaultState = {
+    cycleIndex: 0, // 指向 P.meta.cycle 的下一张
+    progression: {}, // exerciseId -> [{reps, weight}, ...]（上次各组）
+    logs: [], // 历史训练记录（最新在末尾）
+    ladders: { pushup: P.ladders.pushup.current, pullup: P.ladders.pullup.current },
+    overrides: {}, // exerciseId -> 用户在 App 内改的字段（覆盖 program.js 默认值）
+    settings: { voiceOn: true, rate: 1, weightStep: 1 },
+  };
+  let S = loadState();
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(KEY);
+      if (!raw) return structuredClone(defaultState);
+      const parsed = JSON.parse(raw);
+      return Object.assign(structuredClone(defaultState), parsed, {
+        settings: Object.assign({}, defaultState.settings, parsed.settings || {}),
+      });
+    } catch (e) {
+      console.warn("读取存档失败，用默认值", e);
+      return structuredClone(defaultState);
+    }
+  }
+  function saveState() {
+    try {
+      localStorage.setItem(KEY, JSON.stringify(S));
+    } catch (e) {
+      console.warn("保存失败", e);
+    }
+  }
+
+  /* ============================ 语音 & 提示音 ============================ */
+  const Voice = {
+    supported: "speechSynthesis" in window,
+    zh: null,
+    hasZh: false,
+    refresh() {
+      if (!this.supported) return;
+      const vs = window.speechSynthesis.getVoices() || [];
+      this.zh = vs.find((v) => /zh|cmn|Chinese/i.test(v.lang + v.name)) || null;
+      this.hasZh = !!this.zh;
+    },
+    speak(text, { flush = false, force = false } = {}) {
+      if (!S.settings.voiceOn || !this.supported || !text) return;
+      if (!this.hasZh) this.refresh();
+      if (!this.hasZh && !force) return; // 无中文语音引擎：跳过播报，别用英文乱读，靠提示音+大字
+      const doSpeak = () => {
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = "zh-CN";
+        u.rate = S.settings.rate || 1;
+        if (this.zh) u.voice = this.zh;
+        window.speechSynthesis.speak(u);
+      };
+      if (flush) {
+        window.speechSynthesis.cancel();
+        setTimeout(doSpeak, 60); // 规避 Chrome：cancel 紧跟 speak 会被吞掉
+      } else {
+        doSpeak();
+      }
+    },
+    test() {
+      if (!this.supported) return toast("不支持语音", "这个浏览器不支持语音合成。");
+      this.refresh();
+      if (!this.hasZh) return toast("未检测到中文语音", "先装中文语音包，点「如何安装」。");
+      const prev = S.settings.voiceOn;
+      S.settings.voiceOn = true;
+      this.speak("语音测试。中立握俯卧撑，第一组，共四组。", { flush: true, force: true });
+      S.settings.voiceOn = prev;
+    },
+    stop() {
+      if (this.supported) window.speechSynthesis.cancel();
+    },
+  };
+  if (Voice.supported) {
+    Voice.refresh();
+    let lastHasZh = Voice.hasZh;
+    window.speechSynthesis.onvoiceschanged = () => {
+      Voice.refresh();
+      if (Voice.hasZh !== lastHasZh) {
+        lastHasZh = Voice.hasZh;
+        // 中文语音可用性变化时才刷新主页状态条，避免无谓重渲染打断交互
+        if (!session && document.getElementById("startBtn")) renderHome();
+      }
+    };
+  }
+
+  // 把用户在 App 内改过的字段合并到动作上（program.js 是默认值/出厂设置）
+  function resolveEx(base) {
+    const ov = S.overrides[base.id];
+    return ov ? Object.assign({}, base, ov) : base;
+  }
+  function baseExercise(menuId, exId) {
+    return P.menus[menuId].exercises.find((e) => e.id === exId);
+  }
+
+  let audioCtx = null;
+  function beep(freq = 880, dur = 0.15, when = 0) {
+    if (!S.settings.voiceOn) return;
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const t = audioCtx.currentTime + when;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.frequency.value = freq;
+      osc.type = "sine";
+      gain.gain.setValueAtTime(0.001, t);
+      gain.gain.exponentialRampToValueAtTime(0.4, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(t);
+      osc.stop(t + dur + 0.02);
+    } catch (e) {
+      /* 忽略 */
+    }
+  }
+
+  /* ============================ 进阶引擎 ============================ */
+  // 依据「训练总目录」双重渐进：先加次数，到区间上限再加难度。器械固定 10kg → 用放慢离心/停顿替代加重。
+  function computeTarget(ex) {
+    const last = S.progression[ex.id]; // [{reps,weight}]
+    const range = ex.repRange || [8, 12];
+    if (!ex.weighted) {
+      // 徒手 / 带辅助：只看次数
+      let repPrefill = range[1];
+      let note = "首次做这个动作：以标准姿势为准，做到 " + ex.repLabel + "。";
+      if (last && last.length) {
+        const maxReps = Math.max(...last.map((s) => s.reps || 0));
+        const allTop = last.every((s) => (s.reps || 0) >= range[1]);
+        repPrefill = maxReps || range[1];
+        if (ex.ladder && allTop) {
+          const lad = P.ladders[ex.ladder];
+          const nextStep = lad.steps[Math.min(S.ladders[ex.ladder] + 1, lad.steps.length - 1)];
+          note = "上次各组都到 " + range[1] + "+，达标可升阶梯 →「" + nextStep + "」。";
+        } else if (allTop) {
+          note = "上次各组都到上限，这次放慢离心或顶端多停 1 秒加难度。";
+        } else {
+          note = "上次最多 " + maxReps + " 次，这次争取每组比上次多 1 个。";
+        }
+      }
+      return { repPrefill, weightPrefill: null, note };
+    }
+    // 哑铃：双重渐进
+    let weightPrefill = ex.defaultWeight || 10;
+    let repPrefill = range[0];
+    let note = "首次：用能标准完成 " + range[0] + " 次的重量起步（现有 10kg，偏重可单手或减幅度）。";
+    if (last && last.length) {
+      const w = last[last.length - 1].weight || weightPrefill;
+      weightPrefill = w;
+      const allTop = last.every((s) => (s.reps || 0) >= range[1]);
+      repPrefill = allTop ? range[1] : range[0];
+      if (allTop) {
+        note = P.meta.weightAdjustable
+          ? "上次 " + w + "kg 各组都到 " + range[1] + " → 这次加重量。"
+          : "上次 " + w + "kg 各组都到 " + range[1] + " → 哑铃固定 10kg，这次放慢离心到 4 秒或顶端多停 1 秒。";
+      } else {
+        note = "维持 " + w + "kg，争取每组多做 1 次，练到 " + range[1] + "。";
+      }
+    }
+    return { repPrefill, weightPrefill, note };
+  }
+
+  /* ============================ 会话状态 ============================ */
+  let session = null;
+  let restTimer = null;
+
+  function suggestedMenuId() {
+    return P.meta.cycle[S.cycleIndex % P.meta.cycle.length];
+  }
+
+  function startSession(menuId, opts) {
+    opts = opts || {};
+    const menu = P.menus[menuId];
+    let exercises = menu.exercises.map(resolveEx);
+    if (opts.trimLast) {
+      // 时间紧：砍掉最后一个「可选」辅助动作
+      const idx = [...exercises].reverse().findIndex((e) => e.optional);
+      if (idx !== -1) exercises.splice(exercises.length - 1 - idx, 1);
+    }
+    session = {
+      menuId,
+      menu,
+      exercises,
+      exIndex: 0,
+      setIndex: 0,
+      logs: {}, // exId -> [{reps,weight,rir,pain}]
+      startedAt: new Date().toISOString(),
+    };
+    renderWarmup();
+  }
+
+  /* ============================ 视图：主页 ============================ */
+  function renderHome() {
+    stopRest();
+    Voice.stop();
+    const sid = suggestedMenuId();
+    const sm = P.menus[sid];
+    const lastLog = S.logs[S.logs.length - 1];
+    app.innerHTML = `
+      <section class="screen home">
+        <header class="home-head">
+          <h1>健身伴侣 <span class="sub">${P.meta.goal}</span></h1>
+          <div class="stage">${P.meta.stage} · ${P.meta.version}</div>
+        </header>
+
+        <div class="suggest-card" id="startBtn" role="button" tabindex="0">
+          <div class="suggest-label">今日建议</div>
+          <div class="suggest-menu">菜单 ${sm.id} · ${sm.title}</div>
+          <div class="suggest-count">${sm.exercises.length} 个动作 · 先热身 ${P.warmup.steps.length} 步</div>
+          <div class="big-cta">▶ 开始今日训练</div>
+        </div>
+
+        <div class="menu-picker">
+          <div class="picker-label">或手动选一张：</div>
+          <div class="menu-btns">
+            ${Object.values(P.menus)
+              .map((m) => `<button class="menu-btn" data-menu="${m.id}"><b>${m.id}</b>${m.title}</button>`)
+              .join("")}
+          </div>
+        </div>
+
+        <div class="voice-status ${Voice.hasZh ? "ok" : "warn"}">
+          <span class="vs-text">${Voice.hasZh ? "✅ 中文语音就绪" : "⚠ 未检测到中文语音，语音播报暂不可用（提示音和大字照常）"}</span>
+          <span class="vs-btns">
+            <button class="link" id="testVoice">测试语音</button>
+            <button class="link" id="installVoice">如何安装</button>
+          </span>
+        </div>
+
+        <div class="settings-row">
+          <label class="toggle">
+            <input type="checkbox" id="voiceToggle" ${S.settings.voiceOn ? "checked" : ""}/>
+            <span>🔊 语音播报${Voice.supported ? "" : "（浏览器不支持）"}</span>
+          </label>
+          <label class="rate">语速 <input type="range" id="rateRange" min="0.6" max="1.4" step="0.1" value="${S.settings.rate}"/></label>
+        </div>
+
+        <div class="foot-links">
+          <button class="link" id="rulesBtn">护伤总则</button>
+          <button class="link" id="logBtn">训练日志（${S.logs.length}）</button>
+          <button class="link" id="exportBtn">导出备份</button>
+          <button class="link" id="importBtn">导入备份</button>
+          <input type="file" id="importFile" accept="application/json" hidden/>
+        </div>
+        ${lastLog ? `<div class="last-log">上次：${fmtDate(lastLog.date)} · 菜单 ${lastLog.menuId} · ${lastLog.setCount} 组</div>` : ""}
+      </section>`;
+
+    $("#startBtn").addEventListener("click", () => startSession(sid));
+    $("#startBtn").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") startSession(sid);
+    });
+    app.querySelectorAll(".menu-btn").forEach((b) =>
+      b.addEventListener("click", () => startSession(b.dataset.menu))
+    );
+    $("#voiceToggle").addEventListener("change", (e) => {
+      S.settings.voiceOn = e.target.checked;
+      saveState();
+      if (S.settings.voiceOn) Voice.speak("语音已开启");
+    });
+    $("#rateRange").addEventListener("change", (e) => {
+      S.settings.rate = parseFloat(e.target.value);
+      saveState();
+      Voice.speak("语速示例");
+    });
+    $("#testVoice").addEventListener("click", () => Voice.test());
+    $("#installVoice").addEventListener("click", showVoiceInstall);
+    $("#rulesBtn").addEventListener("click", showRules);
+    $("#logBtn").addEventListener("click", showLog);
+    $("#exportBtn").addEventListener("click", exportBackup);
+    $("#importBtn").addEventListener("click", () => $("#importFile").click());
+    $("#importFile").addEventListener("change", importBackup);
+  }
+
+  /* ============================ 视图：热身 ============================ */
+  function renderWarmup() {
+    stopRest();
+    Voice.speak("开始热身，" + P.warmup.steps.length + " 步，做完进入菜单 " + session.menuId, { flush: true });
+    app.innerHTML = `
+      <section class="screen warmup">
+        <div class="crumb">菜单 ${session.menu.id} · ${session.menu.title}</div>
+        <h2>热身（必做）</h2>
+        <p class="hint">${P.warmup.note}</p>
+        <ul class="check-list">
+          ${P.warmup.steps
+            .map(
+              (s, i) => `
+            <li class="check-item" data-i="${i}">
+              <span class="ck"></span>
+              <div>
+                <div class="ci-name">${s.name} <em>${s.amount}</em></div>
+                <div class="ci-purpose">${s.purpose}</div>
+              </div>
+            </li>`
+            )
+            .join("")}
+        </ul>
+        <div class="btn-row">
+          <button class="btn ghost" id="skipWarm">跳过热身</button>
+          <button class="btn primary" id="doneWarm">进入正式训练 ▶</button>
+        </div>
+      </section>`;
+
+    app.querySelectorAll(".check-item").forEach((li) =>
+      li.addEventListener("click", () => {
+        li.classList.toggle("done");
+        if (li.classList.contains("done")) {
+          const s = P.warmup.steps[+li.dataset.i];
+          Voice.speak(s.name, { flush: true });
+        }
+      })
+    );
+    $("#skipWarm").addEventListener("click", enterPlayer);
+    $("#doneWarm").addEventListener("click", enterPlayer);
+  }
+
+  function enterPlayer() {
+    session.exIndex = 0;
+    session.setIndex = 0;
+    renderPlayer();
+  }
+
+  /* ============================ 视图：训练播放器 ============================ */
+  function renderPlayer() {
+    stopRest();
+    const ex = session.exercises[session.exIndex];
+    const setNo = session.setIndex + 1;
+    const isSuperset = ex.type === "superset";
+    const tgt = computeTarget(ex);
+
+    // 语音播报本组
+    const spokenTarget = isSuperset
+      ? ex.supersetLabel
+      : ex.weighted
+      ? tgt.weightPrefill + "公斤，目标 " + (ex.repLabel || "")
+      : "目标 " + (ex.repLabel || "");
+    Voice.speak(
+      `${ex.name}，第 ${setNo} 组，共 ${ex.sets} 组。${spokenTarget}。${ex.topCue}`,
+      { flush: true }
+    );
+
+    const targetHtml = isSuperset
+      ? `<div class="target-grid">
+           <div class="tg"><span>组合</span><b>${ex.supersetLabel}</b></div>
+           <div class="tg"><span>节奏</span><b>慢而稳</b></div>
+           <div class="tg"><span>组间歇</span><b>${ex.restSec}s</b></div>
+         </div>`
+      : `<div class="target-grid">
+           <div class="tg"><span>目标</span><b>${ex.sets}×${ex.repLabel}</b></div>
+           <div class="tg"><span>节奏</span><b>${ex.tempo || "—"}</b></div>
+           ${ex.weighted ? `<div class="tg"><span>重量</span><b>${tgt.weightPrefill}kg</b></div>` : `<div class="tg"><span>RIR</span><b>${ex.rir != null ? ex.rir : "—"}</b></div>`}
+           <div class="tg"><span>组间歇</span><b>${ex.restSec}s</b></div>
+         </div>`;
+
+    // 「怎么做」直接放到练的这一屏（不用点详情）
+    const stepsHtml = (ex.steps || []).map((s) => `<li>${s}</li>`).join("");
+    const supersetHow = ex.superset
+      ? `<div class="superset-how">${ex.superset.map((s) => `<div><b>${s.name}（${s.reps}）</b>：${s.how}</div>`).join("")}</div>`
+      : "";
+    const howtoHtml = `
+      <div class="howto">
+        <div class="howto-title">怎么做</div>
+        <ol class="howto-steps">${stepsHtml}</ol>
+        ${supersetHow}
+        <div class="feel-row">
+          ${ex.feelGood ? `<div class="feel good">✅ 该有：${ex.feelGood}</div>` : ""}
+          ${ex.feelBad ? `<div class="feel bad">🚫 不该有：${ex.feelBad}</div>` : ""}
+        </div>
+      </div>`;
+
+    app.innerHTML = `
+      <section class="screen player">
+        <div class="crumb">
+          <span>菜单 ${session.menu.id}</span>
+          <span>动作 ${session.exIndex + 1}/${session.exercises.length}</span>
+        </div>
+
+        <div class="ex-id">${ex.id}</div>
+        <h1 class="ex-name">${ex.name}</h1>
+        <div class="set-counter">第 <b>${setNo}</b> / ${ex.sets} 组${ex.perSide ? " · 两侧都做" : ""}</div>
+
+        ${targetHtml}
+
+        <div class="cue-box">⚠ ${ex.topCue}</div>
+
+        ${howtoHtml}
+
+        <div class="prog-note">🎯 ${tgt.note}</div>
+
+        <button class="btn primary huge" id="doneSet">✔ 完成本组</button>
+
+        <div class="more-row">
+          <button class="btn ghost sm" id="detailBtn">📖 详情/编辑</button>
+          <button class="btn ghost sm" id="easierBtn">太难→退阶</button>
+          <button class="btn ghost sm" id="harderBtn">太易→进阶</button>
+          <button class="btn ghost sm" id="skipEx">跳过</button>
+          <button class="btn ghost sm" id="abortBtn">结束</button>
+        </div>
+      </section>`;
+
+    $("#doneSet").addEventListener("click", () => openRecord(ex));
+    $("#detailBtn").addEventListener("click", () => showDetail(ex));
+    $("#harderBtn").addEventListener("click", () => {
+      Voice.speak("进阶：" + ex.progression, { flush: true });
+      toast("进阶", ex.progression);
+    });
+    $("#easierBtn").addEventListener("click", () => {
+      Voice.speak("退阶：" + ex.regression, { flush: true });
+      toast("退阶", ex.regression);
+    });
+    $("#skipEx").addEventListener("click", () => {
+      Voice.speak("跳过 " + ex.name, { flush: true });
+      nextExercise();
+    });
+    $("#abortBtn").addEventListener("click", () => finishSession(true));
+  }
+
+  /* ---------- 记录浮层 ---------- */
+  function openRecord(ex) {
+    const isSuperset = ex.type === "superset";
+    const tgt = computeTarget(ex);
+    const last = S.progression[ex.id];
+    const lastSet = last && last[session.setIndex];
+    const repVal = (lastSet && lastSet.reps) || tgt.repPrefill || "";
+    const wVal = (lastSet && lastSet.weight) || tgt.weightPrefill || "";
+
+    const body = isSuperset
+      ? `<p class="rec-superset">${ex.supersetLabel}</p>
+         <div class="rec-field">
+           <label>完成情况</label>
+           <div class="pain-toggle"><button class="pt active" data-ok="1">✅ 完成</button></div>
+         </div>`
+      : `
+        <div class="rec-field">
+          <label>次数${ex.perSide ? "（每侧）" : ""}</label>
+          ${stepper("recReps", repVal, 1, 0, 100)}
+        </div>
+        ${
+          ex.weighted
+            ? `<div class="rec-field"><label>重量 kg</label>${stepper("recWeight", wVal, S.settings.weightStep, 0, 60)}</div>`
+            : ""
+        }`;
+
+    modal(
+      `<h3>记录 · ${ex.id} 第 ${session.setIndex + 1} 组</h3>
+       ${body}
+       <div class="rec-field">
+         <label>关节/疼痛</label>
+         <div class="pain-toggle" id="painToggle">
+           <button class="pt active" data-pain="0">无痛 👍</button>
+           <button class="pt" data-pain="1">有点不适 ⚠</button>
+         </div>
+       </div>`,
+      [
+        { label: "保存 →", cls: "primary", onClick: () => saveSet(ex) },
+      ],
+      { size: "sheet" }
+    );
+
+    // 疼痛切换
+    const pt = $("#painToggle");
+    if (pt)
+      pt.querySelectorAll(".pt").forEach((b) =>
+        b.addEventListener("click", () => {
+          pt.querySelectorAll(".pt").forEach((x) => x.classList.remove("active"));
+          b.classList.add("active");
+        })
+      );
+  }
+
+  function saveSet(ex) {
+    const painBtn = $("#painToggle .pt.active");
+    const pain = painBtn ? painBtn.dataset.pain === "1" : false;
+    const rec = { pain };
+    if (ex.type !== "superset") {
+      rec.reps = parseInt($("#recReps").value, 10) || 0;
+      if (ex.weighted) rec.weight = parseFloat($("#recWeight").value) || 0;
+    } else {
+      rec.done = true;
+    }
+    if (!session.logs[ex.id]) session.logs[ex.id] = [];
+    session.logs[ex.id][session.setIndex] = rec;
+    closeModal();
+
+    if (pain) Voice.speak("记下不适。若关节刺痛或异响伴痛，请停下换动作。", { flush: true });
+
+    // 还有下一组？→ 休息；否则下一个动作
+    if (session.setIndex < ex.sets - 1) {
+      startRest(ex);
+    } else {
+      nextExercise();
+    }
+  }
+
+  /* ============================ 视图：组间休息 ============================ */
+  function startRest(ex) {
+    let remain = ex.restSec || 60;
+    const total = remain;
+    const nextSetNo = session.setIndex + 2; // 下一组编号
+    beep(660, 0.12);
+    Voice.speak("休息 " + remain + " 秒", { flush: true });
+
+    app.innerHTML = `
+      <section class="screen rest">
+        <div class="crumb">${ex.id} · ${ex.name}</div>
+        <div class="rest-label">组间休息</div>
+        <div class="ring-wrap">
+          <svg viewBox="0 0 200 200" class="ring">
+            <circle class="ring-bg" cx="100" cy="100" r="90"/>
+            <circle class="ring-fg" cx="100" cy="100" r="90" id="ringFg"/>
+          </svg>
+          <div class="ring-num" id="restNum">${remain}</div>
+        </div>
+        <div class="next-up">下一组：${ex.name} 第 ${nextSetNo}/${ex.sets} 组</div>
+        <div class="btn-row">
+          <button class="btn ghost" id="add30">+30s</button>
+          <button class="btn primary" id="skipRest">跳过 · 开始下一组</button>
+        </div>
+      </section>`;
+
+    const ring = $("#ringFg");
+    const C = 2 * Math.PI * 90;
+    ring.style.strokeDasharray = C;
+    const paint = () => {
+      ring.style.strokeDashoffset = C * (1 - remain / total);
+      $("#restNum").textContent = remain;
+    };
+    paint();
+
+    stopRest();
+    restTimer = setInterval(() => {
+      remain--;
+      if (remain === 10) {
+        beep(620, 0.12); // 十秒警告：双低音
+        beep(620, 0.12, 0.18);
+        Voice.speak("还有十秒", { flush: true });
+      }
+      if (remain <= 3 && remain > 0) beep(700, 0.08);
+      if (remain <= 0) {
+        stopRest();
+        beep(784, 0.14); // 开始下一组：上行两音
+        beep(1046, 0.22, 0.14);
+        finishRest(ex);
+        return;
+      }
+      paint();
+    }, 1000);
+
+    $("#add30").addEventListener("click", () => {
+      remain += 30;
+      paint();
+    });
+    $("#skipRest").addEventListener("click", () => {
+      stopRest();
+      finishRest(ex);
+    });
+  }
+
+  function finishRest(ex) {
+    session.setIndex++;
+    Voice.speak("开始下一组，" + ex.name + "，第 " + (session.setIndex + 1) + " 组", { flush: true });
+    renderPlayer();
+  }
+
+  function stopRest() {
+    if (restTimer) {
+      clearInterval(restTimer);
+      restTimer = null;
+    }
+  }
+
+  /* ---------- 动作切换 ---------- */
+  function nextExercise() {
+    session.exIndex++;
+    session.setIndex = 0;
+    if (session.exIndex >= session.exercises.length) {
+      finishSession(false);
+      return;
+    }
+    const ex = session.exercises[session.exIndex];
+    // 过渡确认
+    modal(
+      `<h3>完成上一个动作 ✔</h3>
+       <p class="next-ex">下一个：<b>${ex.id} · ${ex.name}</b></p>
+       <p class="hint">${ex.sets} × ${ex.repLabel || ex.supersetLabel || ""}</p>`,
+      [{ label: "开始 ▶", cls: "primary", onClick: () => { closeModal(); renderPlayer(); } }],
+      { size: "sheet" }
+    );
+    Voice.speak("下一个动作，" + ex.name, { flush: true });
+  }
+
+  /* ============================ 视图：训练总结 ============================ */
+  function finishSession(aborted) {
+    stopRest();
+    const doneExs = Object.keys(session.logs);
+    let setCount = 0;
+    doneExs.forEach((id) => (setCount += session.logs[id].filter(Boolean).length));
+    Voice.speak(aborted ? "训练结束。" : "全部完成，做得好！", { flush: true });
+
+    const rows = session.exercises
+      .map((ex) => {
+        const l = session.logs[ex.id];
+        if (!l || !l.filter(Boolean).length) return "";
+        const detail =
+          ex.type === "superset"
+            ? l.filter(Boolean).length + " 组完成"
+            : l
+                .filter(Boolean)
+                .map((s) => (s.weight ? s.reps + "@" + s.weight : s.reps))
+                .join(" / ");
+        const pain = l.some((s) => s && s.pain) ? " ⚠" : "";
+        return `<tr><td>${ex.id}</td><td>${ex.name}</td><td>${detail}${pain}</td></tr>`;
+      })
+      .join("");
+
+    app.innerHTML = `
+      <section class="screen summary">
+        <h2>${aborted ? "训练结束" : "🎉 全部完成"}</h2>
+        <div class="sum-stat">菜单 ${session.menu.id} · ${doneExs.length} 个动作 · ${setCount} 组</div>
+        <table class="sum-table">${rows || "<tr><td>本次没有记录</td></tr>"}</table>
+
+        <div class="sum-form">
+          <div class="rec-field"><label>短板打卡 · 俯卧撑最多连续</label>${stepper("bmPushup", "", 1, 0, 60)}</div>
+          <div class="rec-field"><label>短板打卡 · 引体最多连续</label>${stepper("bmPullup", "", 1, 0, 30)}</div>
+          <div class="rec-field"><label>今日体重 kg（可选）</label>${stepper("bwKg", "", 0.1, 0, 200)}</div>
+          <div class="rec-field">
+            <label>状态</label>
+            <div class="pain-toggle" id="condToggle">
+              <button class="pt active" data-c="好">好</button>
+              <button class="pt" data-c="一般">一般</button>
+              <button class="pt" data-c="差">差</button>
+            </div>
+          </div>
+          <div class="rec-field"><label>备注</label><input type="text" id="sumNote" class="text-in" placeholder="今天的感受、哪个动作有反应…"/></div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn primary huge" id="saveSession">保存并结束</button>
+        </div>
+      </section>`;
+
+    const ct = $("#condToggle");
+    ct.querySelectorAll(".pt").forEach((b) =>
+      b.addEventListener("click", () => {
+        ct.querySelectorAll(".pt").forEach((x) => x.classList.remove("active"));
+        b.classList.add("active");
+      })
+    );
+    $("#saveSession").addEventListener("click", () => commitSession(aborted));
+  }
+
+  function commitSession(aborted) {
+    // 1) 写进阶状态（供下次预填）
+    Object.keys(session.logs).forEach((id) => {
+      const clean = session.logs[id].filter(Boolean);
+      if (clean.length) S.progression[id] = clean;
+    });
+    // 2) 写历史日志
+    let setCount = 0;
+    Object.keys(session.logs).forEach((id) => (setCount += session.logs[id].filter(Boolean).length));
+    const cond = $("#condToggle .pt.active");
+    const rec = {
+      date: session.startedAt,
+      menuId: session.menuId,
+      title: session.menu.title,
+      setCount,
+      sets: session.logs,
+      aborted,
+      benchmarks: {
+        pushup: numOrNull($("#bmPushup").value),
+        pullup: numOrNull($("#bmPullup").value),
+      },
+      bodyweight: numOrNull($("#bwKg").value),
+      condition: cond ? cond.dataset.c : null,
+      note: $("#sumNote").value || "",
+    };
+    S.logs.push(rec);
+    // 3) 循环前进（异常中止也算走过这张，方便下次换一张；如需重练可手动选）
+    S.cycleIndex = (S.cycleIndex + 1) % P.meta.cycle.length;
+    saveState();
+    Voice.speak("已保存。下次建议练菜单 " + suggestedMenuId() + "。", { flush: true });
+    session = null;
+    showRecordExport(rec); // 生成本次训练的 Markdown 记录，可复制/下载；「完成」回主页
+  }
+
+  /* ============================ 详情 / 规则 / 日志 弹层 ============================ */
+  function showDetail(ex) {
+    const list = (arr) => (arr || []).map((x) => `<li>${x}</li>`).join("");
+    const supersetHtml = ex.superset
+      ? `<h4>组合动作</h4><ul>${ex.superset.map((s) => `<li><b>${s.name}（${s.reps}）</b>：${s.how}</li>`).join("")}</ul>`
+      : "";
+    modal(
+      `<div class="detail">
+        <h3>${ex.id} · ${ex.name}</h3>
+        <div class="d-meta">🎯 ${ex.target}<br/>🧰 ${ex.equipment}</div>
+        <div class="d-target">${ex.type === "superset" ? ex.supersetLabel : ex.sets + " × " + ex.repLabel + " · 节奏 " + (ex.tempo || "—") + " · 歇 " + ex.restSec + "s"}</div>
+        ${supersetHtml}
+        <h4>起始姿势</h4><ol>${list(ex.setup)}</ol>
+        <h4>动作过程</h4><ol>${list(ex.steps)}</ol>
+        <h4 class="good">✅ 该有的感觉</h4><p>${ex.feelGood || ""}</p>
+        <h4 class="bad">🚫 不该有的感觉</h4><p>${ex.feelBad || ""}</p>
+        <h4>常见错误 → 纠正</h4><ul>${list(ex.mistakes)}</ul>
+        ${ex.personalNote ? `<h4>针对你</h4><p class="mine">${ex.personalNote}</p>` : ""}
+        <h4>太难 → 退阶</h4><p>${ex.regression || "—"}</p>
+        <h4>太易 → 进阶</h4><p>${ex.progression || "—"}</p>
+      </div>`,
+      [
+        { label: "✏ 编辑", cls: "ghost", onClick: () => openEdit(ex) },
+        { label: "关闭", cls: "primary", onClick: closeModal },
+      ],
+      { size: "full" }
+    );
+  }
+
+  function showRules() {
+    modal(
+      `<h3>护伤总则</h3><ol class="rules">${P.injuryRules.map((r) => `<li>${r}</li>`).join("")}</ol>`,
+      [{ label: "知道了", cls: "primary", onClick: closeModal }],
+      { size: "full" }
+    );
+  }
+
+  function showLog() {
+    if (!S.logs.length) {
+      modal(`<h3>训练日志</h3><p class="hint">还没有记录，练一次就有了。</p>`, [
+        { label: "关闭", cls: "primary", onClick: closeModal },
+      ]);
+      return;
+    }
+    const rows = S.logs
+      .map((l, idx) => ({ l, idx }))
+      .reverse()
+      .map(({ l, idx }) => {
+        const bench = [];
+        if (l.benchmarks && l.benchmarks.pushup) bench.push("俯卧撑 " + l.benchmarks.pushup);
+        if (l.benchmarks && l.benchmarks.pullup) bench.push("引体 " + l.benchmarks.pullup);
+        return `<div class="log-row">
+          <div class="log-top"><b>${fmtDate(l.date)}</b> · 菜单 ${l.menuId} · ${l.setCount} 组 ${l.condition ? "· " + l.condition : ""}</div>
+          ${l.bodyweight ? `<div class="log-sub">体重 ${l.bodyweight}kg</div>` : ""}
+          ${bench.length ? `<div class="log-sub">短板：${bench.join(" · ")}</div>` : ""}
+          ${l.note ? `<div class="log-note">${l.note}</div>` : ""}
+          <div class="log-actions">
+            <button class="link" data-copymd="${idx}">复制 Markdown</button>
+            <button class="link" data-dlmd="${idx}">下载 .md</button>
+          </div>
+        </div>`;
+      })
+      .join("");
+    modal(`<h3>训练日志（最近在上）</h3><div class="log-list">${rows}</div>`, [
+      { label: "关闭", cls: "primary", onClick: closeModal },
+    ], { size: "full" });
+    document.querySelectorAll("[data-copymd]").forEach((b) =>
+      b.addEventListener("click", () => copyText(buildMarkdown(S.logs[+b.dataset.copymd])))
+    );
+    document.querySelectorAll("[data-dlmd]").forEach((b) =>
+      b.addEventListener("click", () => { const r = S.logs[+b.dataset.dlmd]; downloadText(buildMarkdown(r), recFilename(r)); })
+    );
+  }
+
+  /* ============================ 备份导出/导入 ============================ */
+  function exportBackup() {
+    const blob = new Blob([JSON.stringify(S, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const d = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = "健身伴侣备份_" + d + ".json";
+    a.click();
+    URL.revokeObjectURL(url);
+    toast("已导出", "备份文件已开始下载。");
+  }
+  function importBackup(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        S = Object.assign(structuredClone(defaultState), data, {
+          settings: Object.assign({}, defaultState.settings, data.settings || {}),
+        });
+        saveState();
+        toast("已导入", "备份已恢复。");
+        renderHome();
+      } catch (err) {
+        toast("导入失败", "文件格式不对。");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }
+
+  /* ============================ 通用 UI 组件 ============================ */
+  function stepper(id, val, step, min, max) {
+    return `<div class="stepper">
+      <button type="button" class="st-btn" data-step="${id}" data-dir="-1">−</button>
+      <input type="number" id="${id}" value="${val}" step="${step}" min="${min}" max="${max}" inputmode="decimal"/>
+      <button type="button" class="st-btn" data-step="${id}" data-dir="1">+</button>
+    </div>`;
+  }
+
+  function modal(html, buttons, opts) {
+    opts = opts || {};
+    closeModal();
+    const wrap = document.createElement("div");
+    wrap.className = "modal-wrap";
+    wrap.id = "modal";
+    wrap.innerHTML = `
+      <div class="modal ${opts.size || ""}">
+        <div class="modal-body">${html}</div>
+        <div class="modal-actions">
+          ${buttons.map((b, i) => `<button class="btn ${b.cls || "ghost"}" data-mb="${i}">${b.label}</button>`).join("")}
+        </div>
+      </div>`;
+    document.body.appendChild(wrap);
+    buttons.forEach((b, i) => wrap.querySelector(`[data-mb="${i}"]`).addEventListener("click", b.onClick));
+    wrap.addEventListener("click", (e) => {
+      if (e.target === wrap && opts.size !== "sheet") closeModal();
+    });
+    wireSteppers(wrap);
+  }
+  function closeModal() {
+    const m = $("#modal");
+    if (m) m.remove();
+  }
+
+  function wireSteppers(root) {
+    root.querySelectorAll(".st-btn").forEach((b) =>
+      b.addEventListener("click", () => {
+        const input = $("#" + b.dataset.step, root) || $("#" + b.dataset.step);
+        if (!input) return;
+        const step = parseFloat(input.step) || 1;
+        let v = parseFloat(input.value) || 0;
+        v = Math.round((v + step * parseInt(b.dataset.dir, 10)) * 100) / 100;
+        const min = parseFloat(input.min);
+        if (!isNaN(min)) v = Math.max(min, v);
+        input.value = v;
+      })
+    );
+  }
+
+  let toastTimer = null;
+  function toast(title, msg) {
+    let t = $("#toast");
+    if (!t) {
+      t = document.createElement("div");
+      t.id = "toast";
+      t.className = "toast";
+      document.body.appendChild(t);
+    }
+    t.innerHTML = `<b>${title}</b>${msg ? "<span>" + msg + "</span>" : ""}`;
+    t.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
+  }
+
+  /* ============================ 工具 ============================ */
+  function fmtDate(iso) {
+    try {
+      const d = new Date(iso);
+      return `${d.getMonth() + 1}/${d.getDate()}`;
+    } catch (e) {
+      return iso;
+    }
+  }
+  function numOrNull(v) {
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  }
+
+  // 全局委托 stepper（player 记录浮层等动态内容也覆盖）
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest && e.target.closest(".st-btn");
+    if (b && !b.closest(".modal-wrap")) {
+      const input = document.getElementById(b.dataset.step);
+      if (input) {
+        const step = parseFloat(input.step) || 1;
+        let v = parseFloat(input.value) || 0;
+        v = Math.round((v + step * parseInt(b.dataset.dir, 10)) * 100) / 100;
+        const min = parseFloat(input.min);
+        if (!isNaN(min)) v = Math.max(min, v);
+        input.value = v;
+      }
+    }
+  });
+
+  /* ============================ 语音安装引导 ============================ */
+  function showVoiceInstall() {
+    modal(
+      `<h3>安装中文语音（Windows）</h3>
+       <p class="hint">你这台电脑现在只装了英文语音，所以听不到中文播报。装一个中文语音后即可全程语音引导。</p>
+       <h4>方法一（推荐）：语言设置</h4>
+       <ol class="rules">
+         <li>Win 设置 → <b>时间和语言</b> → <b>语言和区域</b>。</li>
+         <li>「添加语言」→ 选 <b>中文（简体，中国）</b> → 安装（勾上「语音」相关选项）。</li>
+         <li>装完 <b>重启浏览器</b>，回来点「测试语音」。</li>
+       </ol>
+       <h4>方法二：讲述人语音</h4>
+       <ol class="rules">
+         <li>Win 设置 → <b>辅助功能</b> → <b>讲述人</b> → 「添加更多语音」。</li>
+         <li>添加中文（如 Microsoft Huihui / Kangkang）。</li>
+       </ol>
+       <p class="mine">提示：微软 <b>Edge</b> 浏览器自带的在线自然语音通常更好听——用 Edge 打开本页试试。没有语音也没关系，提示音和大字流程完全够用。</p>`,
+      [
+        { label: "重新检测", cls: "ghost", onClick: () => { Voice.refresh(); closeModal(); renderHome(); } },
+        { label: "知道了", cls: "primary", onClick: closeModal },
+      ],
+      { size: "full" }
+    );
+  }
+
+  /* ============================ App 内编辑动作 ============================ */
+  function editField(label, id, val, step, min, max) {
+    return `<div class="rec-field"><label>${label}</label>${stepper(id, val === null || val === undefined ? "" : val, step, min, max)}</div>`;
+  }
+  function editText(label, id, val) {
+    return `<div class="rec-field"><label>${label}</label><input type="text" id="${id}" class="text-in" value="${escapeAttr(val || "")}"/></div>`;
+  }
+
+  function openEdit(ex) {
+    const rr = ex.repRange || [8, 12];
+    const rows = [];
+    rows.push(editField("组数", "edSets", ex.sets, 1, 1, 12));
+    if (ex.rirBased) {
+      rows.push(editText("目标（显示文字，如 RIR2）", "edLabel", ex.repLabel));
+      rows.push(editField("RIR（留几次余量）", "edRir", ex.rir, 1, 0, 5));
+      rows.push(editField("达标次数（用于升阶判定）", "edRepMax", rr[1], 1, 1, 100));
+    } else {
+      rows.push(editField("次数下限", "edRepMin", rr[0], 1, 0, 100));
+      rows.push(editField("次数上限", "edRepMax", rr[1], 1, 0, 100));
+    }
+    rows.push(editText("节奏（如 3-1-1）", "edTempo", ex.tempo));
+    rows.push(editField("组间歇（秒）", "edRest", ex.restSec || 60, 5, 0, 600));
+    if (ex.weighted) rows.push(editField("默认重量（kg）", "edW", ex.defaultWeight || 10, 1, 0, 100));
+    rows.push(editText("关键提示（练时高亮那句）", "edCue", ex.topCue));
+
+    modal(
+      `<h3>✏ 编辑 · ${ex.id} ${ex.name}</h3>
+       <p class="hint">改动只存在你本机、随时可「恢复默认」。大段动作说明仍在 program.js 改。</p>
+       <div class="edit-form">${rows.join("")}</div>`,
+      [
+        { label: "恢复默认", cls: "ghost", onClick: () => { delete S.overrides[ex.id]; saveState(); afterEdit(ex.id, "已恢复默认"); } },
+        { label: "保存", cls: "primary", onClick: () => saveEdit(ex) },
+      ],
+      { size: "full" }
+    );
+  }
+
+  function saveEdit(ex) {
+    const rr = ex.repRange || [8, 12];
+    const ov = {
+      sets: readInt("edSets", ex.sets),
+      tempo: readVal("edTempo", ex.tempo),
+      restSec: readInt("edRest", ex.restSec),
+      topCue: readVal("edCue", ex.topCue),
+    };
+    if (ex.rirBased) {
+      ov.repLabel = readVal("edLabel", ex.repLabel);
+      const rir = readInt("edRir", ex.rir);
+      ov.rir = isNaN(rir) ? null : rir;
+      ov.repRange = [rr[0], readInt("edRepMax", rr[1])];
+    } else {
+      const mn = readInt("edRepMin", rr[0]);
+      const mx = readInt("edRepMax", rr[1]);
+      ov.repRange = [mn, mx];
+      ov.repLabel = mn === mx ? String(mx) : mn + "–" + mx;
+    }
+    if (ex.weighted) ov.defaultWeight = readNum("edW", ex.defaultWeight);
+    S.overrides[ex.id] = ov;
+    saveState();
+    afterEdit(ex.id, "已保存");
+  }
+
+  function afterEdit(exId, msg) {
+    closeModal();
+    toast(msg, "改动已存到本机。");
+    if (session) {
+      const i = session.exercises.findIndex((e) => e.id === exId);
+      if (i !== -1) {
+        session.exercises[i] = resolveEx(baseExercise(session.menuId, exId));
+        if (i === session.exIndex) renderPlayer();
+      }
+    }
+  }
+
+  function readVal(id, dflt) { const el = document.getElementById(id); return el ? el.value : dflt; }
+  function readInt(id, dflt) { const el = document.getElementById(id); const n = parseInt(el && el.value, 10); return isNaN(n) ? dflt : n; }
+  function readNum(id, dflt) { const el = document.getElementById(id); const n = parseFloat(el && el.value); return isNaN(n) ? dflt : n; }
+
+  /* ============================ Markdown 记录生成 ============================ */
+  function buildMarkdown(rec) {
+    const menu = P.menus[rec.menuId];
+    const L = [];
+    L.push(`### ${fmtFullDate(rec.date)} · 菜单${rec.menuId} · ${rec.title}`);
+    L.push(`体重：${rec.bodyweight ? rec.bodyweight + "kg" : "—"}   状态：${rec.condition || "—"}`);
+    L.push("");
+    (menu ? menu.exercises : []).forEach((base) => {
+      const l = rec.sets[base.id];
+      if (!l) return;
+      const clean = l.filter(Boolean);
+      if (!clean.length) return;
+      let detail;
+      if (base.type === "superset") {
+        detail = clean.length + " 组完成";
+      } else {
+        detail = clean.length + "×" + clean.map((s) => (s.weight ? s.reps + "@" + s.weight + "kg" : s.reps)).join("/");
+      }
+      const pain = clean.some((s) => s.pain) ? " ⚠有不适" : "";
+      L.push(`- ${base.id} ${base.name} —— ${detail}${pain}`);
+    });
+    L.push("");
+    const bm = rec.benchmarks || {};
+    L.push(`短板打卡：俯卧撑最多连续 ${bm.pushup != null ? bm.pushup : "—"} / 引体最多连续 ${bm.pullup != null ? bm.pullup : "—"}`);
+    const painExs = Object.keys(rec.sets).filter((id) => (rec.sets[id] || []).some((s) => s && s.pain));
+    L.push(`膝盖/疼痛：${painExs.length ? painExs.join("、") + " 有不适" : "无痛"}`);
+    if (rec.note) L.push(`备注：${rec.note}`);
+    return L.join("\n");
+  }
+
+  function recFilename(rec) {
+    return "训练记录_" + fmtFullDate(rec.date) + "_菜单" + rec.menuId + ".md";
+  }
+
+  function showRecordExport(rec) {
+    const md = buildMarkdown(rec);
+    modal(
+      `<h3>📋 训练记录（Markdown）</h3>
+       <p class="hint">复制到 Notion / Obsidian，或下载 .md 并进《训练日志.md》。</p>
+       <pre class="md-preview">${escapeHtml(md)}</pre>`,
+      [
+        { label: "复制", cls: "ghost", onClick: () => copyText(md) },
+        { label: "下载 .md", cls: "ghost", onClick: () => downloadText(md, recFilename(rec)) },
+        { label: "完成", cls: "primary", onClick: () => { closeModal(); renderHome(); } },
+      ],
+      { size: "full" }
+    );
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => toast("已复制", "记录已到剪贴板。"), () => fallbackCopy(text));
+    } else {
+      fallbackCopy(text);
+    }
+  }
+  function fallbackCopy(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); toast("已复制", "记录已复制。"); }
+    catch (e) { toast("复制失败", "请手动选择文本复制。"); }
+    ta.remove();
+  }
+  function downloadText(text, filename) {
+    const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+  function escapeAttr(s) { return String(s).replace(/"/g, "&quot;"); }
+  function fmtFullDate(iso) {
+    try {
+      const d = new Date(iso);
+      const p = (n) => String(n).padStart(2, "0");
+      return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+    } catch (e) { return iso; }
+  }
+
+  /* ============================ 启动 ============================ */
+  renderHome();
+})();
