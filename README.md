@@ -81,3 +81,13 @@
 ## 工作方式
 
 每次练完把实际组数/次数/感受发我 → 我更新 [训练日志.md](训练日志.md) 并按渐进超负荷调整。每 2 周量围度、每 4 周拍照对比。每 3–4 周小复盘、每 8–12 周阶段升级。
+
+## 在别的设备上用（GitHub 同步）
+
+本项目托管在私有仓库 `https://github.com/freeman2026usa-tech/exerciseapp`（含个人健康信息，未公开）。
+
+- **第一次到新设备**：`git clone https://github.com/freeman2026usa-tech/exerciseapp.git`
+- **以后同步更新**：进项目目录，`git pull`
+- **有改动后**：`git add -A && git commit -m "说明"` 再 `git push`；换设备前先 `git pull`，避免两台机器同时改冲突（单人使用，按"改完就推、用前就拉"来即可）
+
+> **重要提醒**：训练记录（每组次数/重量、身体数据打卡）存在**浏览器本机的 localStorage**，不是文件，`git clone`/`git pull` **不会**带走这些训练历史——那是每台设备各自的浏览器数据。换设备想接着看历史，用 App 里的`导出备份`(JSON，完整迁移) 或练完弹出的`Markdown 记录`(可读、可贴回日志)，详见 [app/README.md](app/README.md)。
