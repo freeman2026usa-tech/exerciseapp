@@ -84,10 +84,12 @@
 
 ## 在别的设备上用（GitHub 同步）
 
-本项目托管在私有仓库 `https://github.com/freeman2026usa-tech/exerciseapp`（含个人健康信息，未公开）。
+本项目托管在私有仓库 `https://github.com/freeman2026usa-tech/exerciseapp`（含个人健康信息，**保持私有，不对外公开**）。私有仓库下载需要凭据，用**只读部署令牌**免交互式登录：
 
-- **第一次到新设备**：`git clone https://github.com/freeman2026usa-tech/exerciseapp.git`
-- **以后同步更新**：进项目目录，`git pull`
+- **准备一次**（已生成过可跳过）：github.com → Settings → Developer settings → Fine-grained tokens → New token → 仓库范围选 `exerciseapp`、权限只给 `Contents: Read-only` → 生成后复制 `github_pat_...` 令牌，自己保存好（GitHub 只显示一次）。
+- **第一次到新设备**：`git clone https://<你的令牌>@github.com/freeman2026usa-tech/exerciseapp.git`（把 `<你的令牌>` 换成上面生成的那串，全程不弹登录）
+- **以后同步更新**：进项目目录，`git pull`（凭据已记住，不用再带令牌）
 - **有改动后**：`git add -A && git commit -m "说明"` 再 `git push`；换设备前先 `git pull`，避免两台机器同时改冲突（单人使用，按"改完就推、用前就拉"来即可）
+- **想收回某台设备的访问权**：回 github.com 令牌页面删掉对应令牌即可，不影响其他设备
 
 > **重要提醒**：训练记录（每组次数/重量、身体数据打卡）存在**浏览器本机的 localStorage**，不是文件，`git clone`/`git pull` **不会**带走这些训练历史——那是每台设备各自的浏览器数据。换设备想接着看历史，用 App 里的`导出备份`(JSON，完整迁移) 或练完弹出的`Markdown 记录`(可读、可贴回日志)，详见 [app/README.md](app/README.md)。
