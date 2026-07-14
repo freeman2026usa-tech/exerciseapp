@@ -251,6 +251,80 @@ input[type=number]::-webkit-inner-spin-button { opacity: 1; }
 /* ---------- 日志导出按钮 ---------- */
 .log-actions { display: flex; gap: 10px; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
 
+/* ---------- 主页双板块大卡 ---------- */
+.board-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 24px 0; }
+.board-card {
+  border-radius: 22px; padding: 28px 20px; cursor: pointer; border: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 6px; box-shadow: var(--shadow);
+  transition: transform .08s, border-color .15s; min-height: 190px;
+}
+.board-card:active { transform: scale(.98); }
+.board-card.strength { background: linear-gradient(155deg, #1e3346, #172532); }
+.board-card.strength:hover { border-color: var(--accent2); }
+.board-card.night { background: linear-gradient(155deg, #2a2547, #1c1a2e); }
+.board-card.night:hover { border-color: #9a7bff; }
+.board-emoji { font-size: 40px; }
+.board-name { font-size: clamp(22px, 5vw, 28px); font-weight: 800; }
+.board-desc { color: var(--dim); font-size: 14px; }
+.board-sub { color: var(--dim); font-size: 12px; margin-top: auto; }
+
+/* ---------- 设置卡 / 语音选择器 ---------- */
+.settings-card { border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; margin-bottom: 16px; display: flex; flex-direction: column; gap: 12px; }
+.voice-pick { display: flex; align-items: center; gap: 10px; }
+.voice-pick label { color: var(--dim); font-size: 14px; flex: none; }
+.voice-pick select {
+  flex: 1; min-width: 0; background: var(--card); color: var(--text); border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px 12px; font-size: 15px;
+}
+.crumb .back { padding: 0; }
+
+/* ---------- 播放器·一键完成行 ---------- */
+.done-row { display: flex; gap: 10px; align-items: stretch; margin-top: 8px; }
+.done-row .huge { flex: 1; margin-top: 0; }
+.done-row .adjust { flex: none; border-radius: 18px; padding: 0 20px; color: var(--dim); }
+
+/* ---------- 动作过渡页 ---------- */
+.transition { text-align: center; display: flex; flex-direction: column; align-items: center; padding-top: 60px; }
+.trans-label { color: var(--dim); letter-spacing: 4px; font-size: 16px; }
+.trans-target { color: var(--accent2); font-size: 18px; margin: 6px 0 10px; }
+.trans-count { font-size: clamp(70px, 18vw, 130px); font-weight: 900; color: var(--accent); line-height: 1.1; }
+.transition .btn-row { width: 100%; max-width: 420px; }
+
+/* ---------- 夜间放松 ---------- */
+.night .ex-name { color: #cbb8ff; }
+.night-ring { margin: 14px auto 4px; }
+.night-ring .ring-fg { stroke: #9a7bff; }
+.night-ring .ring-num { font-size: clamp(44px, 12vw, 78px); }
+.breath-circle {
+  position: absolute; left: 50%; top: 50%; width: 56%; height: 56%; border-radius: 50%;
+  background: radial-gradient(circle, rgba(154,123,255,.55), rgba(154,123,255,.06));
+  transform: translate(-50%, -50%) scale(.5);
+  animation: breathe 10s ease-in-out infinite; z-index: 0;
+}
+.breath-circle.release { background: radial-gradient(circle, rgba(120,200,255,.5), rgba(120,200,255,.05)); }
+.night-ring .ring-num { position: relative; z-index: 1; }
+.breath-labels { display: flex; justify-content: center; gap: 28px; margin-bottom: 10px; font-size: 18px; font-weight: 700; }
+.breath-in { color: #b9a6ff; animation: breatheInLabel 10s ease-in-out infinite; }
+.breath-out { color: #7fb7ff; animation: breatheOutLabel 10s ease-in-out infinite; }
+.night-cue {
+  background: rgba(154,123,255,.14); border: 1px solid rgba(154,123,255,.4); color: #cbb8ff;
+  border-radius: 14px; padding: 14px 18px; font-size: clamp(17px, 3.4vw, 21px); font-weight: 700; margin: 6px 0 14px; text-align: center;
+}
+.howto.small .howto-steps li { font-size: 15px; }
+.night-summary .outro { color: var(--dim); font-size: 15px; margin: 8px 0 18px; line-height: 1.6; }
+
+@keyframes breathe {
+  0% { transform: translate(-50%, -50%) scale(.5); }
+  40% { transform: translate(-50%, -50%) scale(1); }
+  100% { transform: translate(-50%, -50%) scale(.5); }
+}
+@keyframes breatheInLabel {
+  0%, 38% { opacity: 1; } 45%, 100% { opacity: .18; }
+}
+@keyframes breatheOutLabel {
+  0%, 40% { opacity: .18; } 47%, 100% { opacity: 1; }
+}
+
 @media (max-width: 420px) {
   .menu-btns { grid-template-columns: repeat(2, 1fr); }
   .btn-row .btn { min-width: calc(50% - 6px); }

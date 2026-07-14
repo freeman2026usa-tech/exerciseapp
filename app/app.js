@@ -17,7 +17,8 @@
     logs: [], // 历史训练记录（最新在末尾）
     ladders: { pushup: P.ladders.pushup.current, pullup: P.ladders.pullup.current },
     overrides: {}, // exerciseId -> 用户在 App 内改的字段（覆盖 program.js 默认值）
-    settings: { voiceOn: true, rate: 1, weightStep: 1 },
+    night: { logs: [] }, // 夜间放松打卡（独立于力量历史，无循环/进阶）
+    settings: { voiceOn: true, rate: 1, weightStep: 1, voiceURI: null, autoAdvance: true },
   };
   let S = loadState();
 
@@ -47,12 +48,16 @@
     supported: "speechSynthesis" in window,
     zh: null,
     hasZh: false,
+    zhList: [],
     refresh() {
       if (!this.supported) return;
       const vs = window.speechSynthesis.getVoices() || [];
-      this.zh = vs.find((v) => /zh|cmn|Chinese/i.test(v.lang + v.name)) || null;
-      this.hasZh = !!this.zh;
+      this.zhList = vs.filter((v) => /zh|cmn|Chinese/i.test(v.lang + v.name));
+      const chosen = S.settings.voiceURI && vs.find((v) => v.voiceURI === S.settings.voiceURI);
+      this.zh = chosen || this.zhList[0] || null;
+      this.hasZh = this.zhList.length > 0;
     },
+    list() { this.refresh(); return this.zhList; },
     speak(text, { flush = false, force = false } = {}) {
       if (!S.settings.voiceOn || !this.supported || !text) return;
       if (!this.hasZh) this.refresh();
@@ -91,8 +96,8 @@
       Voice.refresh();
       if (Voice.hasZh !== lastHasZh) {
         lastHasZh = Voice.hasZh;
-        // 中文语音可用性变化时才刷新主页状态条，避免无谓重渲染打断交互
-        if (!session && document.getElementById("startBtn")) renderHome();
+        // 中文语音可用性变化时才刷新主页（仅当停在主板块页），避免打断交互
+        if (!session && !nightSession && document.getElementById("boardNight")) renderHome();
       }
     };
   }
@@ -173,8 +178,9 @@
   }
 
   /* ============================ 会话状态 ============================ */
-  let session = null;
-  let restTimer = null;
+  let session = null; // 力量会话
+  let nightSession = null; // 夜间放松会话
+  let restTimer = null, nightTimer = null, transTimer = null;
 
   function suggestedMenuId() {
     return P.meta.cycle[S.cycleIndex % P.meta.cycle.length];
@@ -201,13 +207,15 @@
     renderWarmup();
   }
 
-  /* ============================ 视图：主页 ============================ */
+  /* ============================ 视图：主页（选板块） ============================ */
   function renderHome() {
     stopRest();
     Voice.stop();
-    const sid = suggestedMenuId();
-    const sm = P.menus[sid];
+    Voice.refresh();
+    session = null;
+    nightSession = null;
     const lastLog = S.logs[S.logs.length - 1];
+    const lastNight = S.night.logs[S.night.logs.length - 1];
     app.innerHTML = `
       <section class="screen home">
         <header class="home-head">
@@ -215,72 +223,112 @@
           <div class="stage">${P.meta.stage} · ${P.meta.version}</div>
         </header>
 
+        <div class="board-cards">
+          <div class="board-card strength" id="boardStrength" role="button" tabindex="0">
+            <div class="board-emoji">💪</div>
+            <div class="board-name">力量训练</div>
+            <div class="board-desc">四菜单循环 · 倒三角</div>
+            <div class="board-sub">${lastLog ? "上次 " + fmtDate(lastLog.date) + " · 菜单 " + lastLog.menuId : "还没练过"}</div>
+          </div>
+          <div class="board-card night" id="boardNight" role="button" tabindex="0">
+            <div class="board-emoji">🌙</div>
+            <div class="board-name">夜间放松</div>
+            <div class="board-desc">睡前 10 分钟 · E1–E4</div>
+            <div class="board-sub">${lastNight ? "上次 " + fmtDate(lastNight.date) : "还没做过"}</div>
+          </div>
+        </div>
+
+        ${voiceSettingsHtml()}
+
+        <div class="foot-links">
+          <button class="link" id="rulesBtn">护伤总则</button>
+          <button class="link" id="logBtn">训练日志（${S.logs.length}）</button>
+          <button class="link" id="nightLogBtn">夜间记录（${S.night.logs.length}）</button>
+          <button class="link" id="exportBtn">导出备份</button>
+          <button class="link" id="importBtn">导入备份</button>
+          <input type="file" id="importFile" accept="application/json" hidden/>
+        </div>
+      </section>`;
+
+    const goStrength = () => renderStrengthHome();
+    $("#boardStrength").addEventListener("click", goStrength);
+    $("#boardStrength").addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") goStrength(); });
+    $("#boardNight").addEventListener("click", () => startNight());
+    $("#boardNight").addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") startNight(); });
+    wireVoiceSettings();
+    $("#rulesBtn").addEventListener("click", showRules);
+    $("#logBtn").addEventListener("click", showLog);
+    $("#nightLogBtn").addEventListener("click", showNightLog);
+    $("#exportBtn").addEventListener("click", exportBackup);
+    $("#importBtn").addEventListener("click", () => $("#importFile").click());
+    $("#importFile").addEventListener("change", importBackup);
+  }
+
+  // 语音 + 设置卡（主页用）
+  function voiceSettingsHtml() {
+    const voices = Voice.list();
+    const opts = voices
+      .map((v) => `<option value="${escapeAttr(v.voiceURI)}" ${S.settings.voiceURI === v.voiceURI ? "selected" : ""}>${escapeHtml(v.name)}</option>`)
+      .join("");
+    return `
+      <div class="settings-card">
+        <div class="voice-status ${Voice.hasZh ? "ok" : "warn"}">
+          <span class="vs-text">${Voice.hasZh ? "✅ 中文语音就绪" : "⚠ 未检测到中文语音（提示音和大字照常）"}</span>
+          <span class="vs-btns"><button class="link" id="installVoice">${Voice.hasZh ? "想更好听？" : "如何安装"}</button></span>
+        </div>
+        ${Voice.hasZh ? `
+        <div class="voice-pick">
+          <label>声音</label>
+          <select id="voiceSelect">${opts}</select>
+          <button class="btn ghost sm" id="testVoice">试听</button>
+        </div>` : ""}
+        <div class="settings-row">
+          <label class="toggle"><input type="checkbox" id="voiceToggle" ${S.settings.voiceOn ? "checked" : ""}/><span>🔊 语音</span></label>
+          <label class="toggle"><input type="checkbox" id="autoToggle" ${S.settings.autoAdvance ? "checked" : ""}/><span>⚡ 自动进行</span></label>
+          <label class="rate">语速 <input type="range" id="rateRange" min="0.6" max="1.4" step="0.1" value="${S.settings.rate}"/></label>
+        </div>
+      </div>`;
+  }
+  function wireVoiceSettings() {
+    const sel = $("#voiceSelect");
+    if (sel) sel.addEventListener("change", (e) => { S.settings.voiceURI = e.target.value; Voice.refresh(); saveState(); Voice.test(); });
+    const tv = $("#testVoice");
+    if (tv) tv.addEventListener("click", () => Voice.test());
+    $("#installVoice").addEventListener("click", showVoiceInstall);
+    $("#voiceToggle").addEventListener("change", (e) => { S.settings.voiceOn = e.target.checked; saveState(); if (S.settings.voiceOn) Voice.speak("语音已开启", { flush: true }); });
+    $("#autoToggle").addEventListener("change", (e) => { S.settings.autoAdvance = e.target.checked; saveState(); });
+    const rr = $("#rateRange");
+    if (rr) rr.addEventListener("change", (e) => { S.settings.rate = parseFloat(e.target.value); saveState(); Voice.test(); });
+  }
+
+  /* ============================ 视图：力量子首页（选菜单） ============================ */
+  function renderStrengthHome() {
+    stopRest();
+    Voice.stop();
+    const sid = suggestedMenuId();
+    const sm = P.menus[sid];
+    const lastLog = S.logs[S.logs.length - 1];
+    app.innerHTML = `
+      <section class="screen home">
+        <div class="crumb"><button class="link back" id="backHome">‹ 返回</button><span>💪 力量训练</span></div>
         <div class="suggest-card" id="startBtn" role="button" tabindex="0">
           <div class="suggest-label">今日建议</div>
           <div class="suggest-menu">菜单 ${sm.id} · ${sm.title}</div>
           <div class="suggest-count">${sm.exercises.length} 个动作 · 先热身 ${P.warmup.steps.length} 步</div>
           <div class="big-cta">▶ 开始今日训练</div>
         </div>
-
         <div class="menu-picker">
           <div class="picker-label">或手动选一张：</div>
           <div class="menu-btns">
-            ${Object.values(P.menus)
-              .map((m) => `<button class="menu-btn" data-menu="${m.id}"><b>${m.id}</b>${m.title}</button>`)
-              .join("")}
+            ${Object.values(P.menus).map((m) => `<button class="menu-btn" data-menu="${m.id}"><b>${m.id}</b>${m.title}</button>`).join("")}
           </div>
-        </div>
-
-        <div class="voice-status ${Voice.hasZh ? "ok" : "warn"}">
-          <span class="vs-text">${Voice.hasZh ? "✅ 中文语音就绪" : "⚠ 未检测到中文语音，语音播报暂不可用（提示音和大字照常）"}</span>
-          <span class="vs-btns">
-            <button class="link" id="testVoice">测试语音</button>
-            <button class="link" id="installVoice">如何安装</button>
-          </span>
-        </div>
-
-        <div class="settings-row">
-          <label class="toggle">
-            <input type="checkbox" id="voiceToggle" ${S.settings.voiceOn ? "checked" : ""}/>
-            <span>🔊 语音播报${Voice.supported ? "" : "（浏览器不支持）"}</span>
-          </label>
-          <label class="rate">语速 <input type="range" id="rateRange" min="0.6" max="1.4" step="0.1" value="${S.settings.rate}"/></label>
-        </div>
-
-        <div class="foot-links">
-          <button class="link" id="rulesBtn">护伤总则</button>
-          <button class="link" id="logBtn">训练日志（${S.logs.length}）</button>
-          <button class="link" id="exportBtn">导出备份</button>
-          <button class="link" id="importBtn">导入备份</button>
-          <input type="file" id="importFile" accept="application/json" hidden/>
         </div>
         ${lastLog ? `<div class="last-log">上次：${fmtDate(lastLog.date)} · 菜单 ${lastLog.menuId} · ${lastLog.setCount} 组</div>` : ""}
       </section>`;
-
+    $("#backHome").addEventListener("click", renderHome);
     $("#startBtn").addEventListener("click", () => startSession(sid));
-    $("#startBtn").addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") startSession(sid);
-    });
-    app.querySelectorAll(".menu-btn").forEach((b) =>
-      b.addEventListener("click", () => startSession(b.dataset.menu))
-    );
-    $("#voiceToggle").addEventListener("change", (e) => {
-      S.settings.voiceOn = e.target.checked;
-      saveState();
-      if (S.settings.voiceOn) Voice.speak("语音已开启");
-    });
-    $("#rateRange").addEventListener("change", (e) => {
-      S.settings.rate = parseFloat(e.target.value);
-      saveState();
-      Voice.speak("语速示例");
-    });
-    $("#testVoice").addEventListener("click", () => Voice.test());
-    $("#installVoice").addEventListener("click", showVoiceInstall);
-    $("#rulesBtn").addEventListener("click", showRules);
-    $("#logBtn").addEventListener("click", showLog);
-    $("#exportBtn").addEventListener("click", exportBackup);
-    $("#importBtn").addEventListener("click", () => $("#importFile").click());
-    $("#importFile").addEventListener("change", importBackup);
+    $("#startBtn").addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") startSession(sid); });
+    app.querySelectorAll(".menu-btn").forEach((b) => b.addEventListener("click", () => startSession(b.dataset.menu)));
   }
 
   /* ============================ 视图：热身 ============================ */
@@ -339,16 +387,8 @@
     const isSuperset = ex.type === "superset";
     const tgt = computeTarget(ex);
 
-    // 语音播报本组
-    const spokenTarget = isSuperset
-      ? ex.supersetLabel
-      : ex.weighted
-      ? tgt.weightPrefill + "公斤，目标 " + (ex.repLabel || "")
-      : "目标 " + (ex.repLabel || "");
-    Voice.speak(
-      `${ex.name}，第 ${setNo} 组，共 ${ex.sets} 组。${spokenTarget}。${ex.topCue}`,
-      { flush: true }
-    );
+    // 语音只报一句"练时该注意什么"（完整目标/要点看屏幕）
+    Voice.speak(`${ex.name}，第 ${setNo} 组。${ex.voiceCue || ex.topCue}`, { flush: true });
 
     const targetHtml = isSuperset
       ? `<div class="target-grid">
@@ -398,7 +438,10 @@
 
         <div class="prog-note">🎯 ${tgt.note}</div>
 
-        <button class="btn primary huge" id="doneSet">✔ 完成本组</button>
+        <div class="done-row">
+          <button class="btn primary huge" id="doneSet">✔ 完成（按计划）</button>
+          <button class="btn ghost adjust" id="adjustSet">改一下</button>
+        </div>
 
         <div class="more-row">
           <button class="btn ghost sm" id="detailBtn">📖 详情/编辑</button>
@@ -409,7 +452,8 @@
         </div>
       </section>`;
 
-    $("#doneSet").addEventListener("click", () => openRecord(ex));
+    $("#doneSet").addEventListener("click", () => quickLogSet(ex));
+    $("#adjustSet").addEventListener("click", () => openRecord(ex));
     $("#detailBtn").addEventListener("click", () => showDetail(ex));
     $("#harderBtn").addEventListener("click", () => {
       Voice.speak("进阶：" + ex.progression, { flush: true });
@@ -503,6 +547,22 @@
     }
   }
 
+  // 一键按计划完成本组：直接用进阶引擎的目标值记录，不弹浮层
+  function quickLogSet(ex) {
+    const tgt = computeTarget(ex);
+    const rec = { pain: false };
+    if (ex.type === "superset") {
+      rec.done = true;
+    } else {
+      rec.reps = tgt.repPrefill || (ex.repRange ? ex.repRange[1] : 0);
+      if (ex.weighted) rec.weight = tgt.weightPrefill || ex.defaultWeight || 0;
+    }
+    if (!session.logs[ex.id]) session.logs[ex.id] = [];
+    session.logs[ex.id][session.setIndex] = rec;
+    if (session.setIndex < ex.sets - 1) startRest(ex);
+    else nextExercise();
+  }
+
   /* ============================ 视图：组间休息 ============================ */
   function startRest(ex) {
     let remain = ex.restSec || 60;
@@ -574,10 +634,8 @@
   }
 
   function stopRest() {
-    if (restTimer) {
-      clearInterval(restTimer);
-      restTimer = null;
-    }
+    [restTimer, nightTimer, transTimer].forEach((t) => t && clearInterval(t));
+    restTimer = nightTimer = transTimer = null;
   }
 
   /* ---------- 动作切换 ---------- */
@@ -589,15 +647,50 @@
       return;
     }
     const ex = session.exercises[session.exIndex];
-    // 过渡确认
-    modal(
-      `<h3>完成上一个动作 ✔</h3>
-       <p class="next-ex">下一个：<b>${ex.id} · ${ex.name}</b></p>
-       <p class="hint">${ex.sets} × ${ex.repLabel || ex.supersetLabel || ""}</p>`,
-      [{ label: "开始 ▶", cls: "primary", onClick: () => { closeModal(); renderPlayer(); } }],
-      { size: "sheet" }
-    );
-    Voice.speak("下一个动作，" + ex.name, { flush: true });
+    Voice.speak("下一个，" + ex.name, { flush: true });
+    if (!S.settings.autoAdvance) {
+      modal(
+        `<h3>完成上一个动作 ✔</h3>
+         <p class="next-ex">下一个：<b>${ex.id} · ${ex.name}</b></p>
+         <p class="hint">${ex.sets} × ${ex.repLabel || ex.supersetLabel || ""}</p>`,
+        [{ label: "开始 ▶", cls: "primary", onClick: () => { closeModal(); renderPlayer(); } }],
+        { size: "sheet" }
+      );
+      return;
+    }
+    showTransition(ex);
+  }
+
+  // 自动过渡：短暂展示下一个动作，倒数后自动开始（可暂停/立即开始）
+  function showTransition(ex) {
+    stopRest();
+    let n = 3;
+    app.innerHTML = `
+      <section class="screen transition">
+        <div class="trans-label">下一个动作</div>
+        <div class="ex-id">${ex.id}</div>
+        <h1 class="ex-name">${ex.name}</h1>
+        <div class="trans-target">${ex.type === "superset" ? ex.supersetLabel : ex.sets + " × " + ex.repLabel}</div>
+        <div class="trans-count" id="transCount">${n}</div>
+        <div class="btn-row">
+          <button class="btn ghost" id="transPause">暂停</button>
+          <button class="btn primary" id="transGo">立即开始 ▶</button>
+        </div>
+      </section>`;
+    const go = () => { stopRest(); renderPlayer(); };
+    transTimer = setInterval(() => {
+      n--;
+      const el = $("#transCount");
+      if (el) el.textContent = n;
+      if (n <= 0) { stopRest(); go(); }
+    }, 800);
+    $("#transGo").addEventListener("click", go);
+    $("#transPause").addEventListener("click", () => {
+      stopRest();
+      const el = $("#transCount");
+      if (el) el.textContent = "⏸";
+      $("#transPause").style.display = "none";
+    });
   }
 
   /* ============================ 视图：训练总结 ============================ */
@@ -895,6 +988,194 @@
     }
   });
 
+  /* ============================ 夜间放松板块 ============================ */
+  function startNight() {
+    stopRest();
+    Voice.stop();
+    nightSession = { stepIndex: 0, startedAt: new Date().toISOString(), skipped: {}, remain: 0 };
+    renderNightStep();
+  }
+
+  function renderNightStep() {
+    stopRest();
+    const steps = P.night.steps;
+    const step = steps[nightSession.stepIndex];
+    const idx = nightSession.stepIndex;
+    const isBreath = step.type === "breath" || step.type === "release";
+    const isRelease = step.type === "release";
+    Voice.speak(step.name + "。" + step.cue, { flush: true });
+    const li = (a) => (a || []).map((x) => `<li>${x}</li>`).join("");
+    app.innerHTML = `
+      <section class="screen night">
+        <div class="crumb"><button class="link back" id="nightExit">‹ 退出</button><span>🌙 夜间放松 ${idx + 1}/${steps.length}</span></div>
+        <div class="ex-id">${step.id}</div>
+        <h1 class="ex-name">${step.name}</h1>
+        <div class="ring-wrap night-ring">
+          <svg viewBox="0 0 200 200" class="ring"><circle class="ring-bg" cx="100" cy="100" r="90"/><circle class="ring-fg" cx="100" cy="100" r="90" id="nightRingFg"/></svg>
+          ${isBreath ? `<div class="breath-circle ${isRelease ? "release" : ""}"></div>` : ""}
+          <div class="ring-num" id="nightNum">${fmtClock(step.seconds)}</div>
+        </div>
+        ${isBreath ? `<div class="breath-labels"><span class="breath-in">${isRelease ? "吸气 · 松开" : "吸气"}</span><span class="breath-out">${isRelease ? "呼气 · 归位" : "呼气"}</span></div>` : ""}
+        <div class="night-cue">💡 ${step.cue}</div>
+        <div class="howto small">
+          <ol class="howto-steps">${li(step.how)}</ol>
+          <div class="feel-row">
+            ${step.feelGood ? `<div class="feel good">✅ ${step.feelGood}</div>` : ""}
+            ${step.pitfalls ? `<div class="feel bad">🚫 ${step.pitfalls}</div>` : ""}
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn ghost" id="nightAdd">+30s</button>
+          <button class="btn ghost" id="nightSkip">${step.skippable ? "膝不适 · 跳过" : "跳过这步"}</button>
+        </div>
+      </section>`;
+    $("#nightExit").addEventListener("click", () => { stopRest(); nightSession = null; renderHome(); });
+    $("#nightAdd").addEventListener("click", () => { nightSession.remain += 30; const el = $("#nightNum"); if (el) el.textContent = fmtClock(nightSession.remain); });
+    $("#nightSkip").addEventListener("click", () => { nightSession.skipped[step.id] = true; stopRest(); nextNightStep(); });
+    startNightTimer(step);
+  }
+
+  function startNightTimer(step) {
+    nightSession.remain = step.seconds;
+    const total = step.seconds;
+    const C = 2 * Math.PI * 90;
+    const ring = $("#nightRingFg");
+    if (ring) ring.style.strokeDasharray = C;
+    const paint = () => {
+      const ratio = Math.min(1, nightSession.remain / total);
+      if (ring) ring.style.strokeDashoffset = C * (1 - ratio);
+      const el = $("#nightNum");
+      if (el) el.textContent = fmtClock(nightSession.remain);
+    };
+    paint();
+    nightTimer = setInterval(() => {
+      nightSession.remain--;
+      if (nightSession.remain <= 0) {
+        stopRest();
+        beep(784, 0.16);
+        beep(1046, 0.22, 0.14);
+        nextNightStep();
+        return;
+      }
+      if (nightSession.remain === 10 && nightSession.stepIndex < P.night.steps.length - 1) beep(660, 0.1);
+      paint();
+    }, 1000);
+  }
+
+  function nextNightStep() {
+    nightSession.stepIndex++;
+    if (nightSession.stepIndex >= P.night.steps.length) { finishNight(); return; }
+    renderNightStep();
+  }
+
+  function finishNight() {
+    stopRest();
+    Voice.speak("放松完成，做完直接睡吧。", { flush: true });
+    app.innerHTML = `
+      <section class="screen summary night-summary">
+        <h2>🌙 放松完成</h2>
+        <p class="outro">${P.nightMeta.outro}</p>
+        <div class="sum-form">
+          <div class="rec-field">
+            <label>今晚这套做了吗</label>
+            <div class="pain-toggle" id="nkDone">
+              <button class="pt active" data-v="做了">做了</button>
+              <button class="pt" data-v="没做">没做</button>
+            </div>
+          </div>
+          <div class="rec-field">
+            <label>反向凯格尔找到「松」的感觉了吗</label>
+            <div class="pain-toggle" id="nkFound">
+              <button class="pt" data-v="是">是</button>
+              <button class="pt active" data-v="部分">部分</button>
+              <button class="pt" data-v="否">否</button>
+            </div>
+          </div>
+          <div class="rec-field"><label>备注（会阴松紧、睡眠…）</label><input type="text" id="nightNote" class="text-in" placeholder="可留空"/></div>
+        </div>
+        <div class="btn-row"><button class="btn primary huge" id="saveNight">保存并结束</button></div>
+      </section>`;
+    wireToggle("#nkDone");
+    wireToggle("#nkFound");
+    $("#saveNight").addEventListener("click", commitNight);
+  }
+
+  function commitNight() {
+    const doneEl = $("#nkDone .pt.active");
+    const foundEl = $("#nkFound .pt.active");
+    const rec = {
+      date: nightSession ? nightSession.startedAt : new Date().toISOString(),
+      done: doneEl ? doneEl.dataset.v === "做了" : true,
+      reverseKegel: foundEl ? foundEl.dataset.v : "部分",
+      note: $("#nightNote").value || "",
+      skippedE4: !!(nightSession && nightSession.skipped.E4),
+    };
+    S.night.logs.push(rec);
+    saveState();
+    Voice.speak("已记录，晚安。", { flush: true });
+    nightSession = null;
+    showNightExport(rec);
+  }
+
+  function buildNightMarkdown(rec) {
+    return `${fmtFullDate(rec.date)}：晚间放松 ${rec.done ? "做" : "没做"} · 反向凯格尔找到感觉? ${rec.reverseKegel} · 备注(${rec.note || "—"})`;
+  }
+
+  function showNightExport(rec) {
+    const md = buildNightMarkdown(rec);
+    modal(
+      `<h3>🌙 夜间打卡（Markdown）</h3>
+       <p class="hint">复制或下载，贴进《康复日志.md》的放松打卡区。</p>
+       <pre class="md-preview">${escapeHtml(md)}</pre>`,
+      [
+        { label: "复制", cls: "ghost", onClick: () => copyText(md) },
+        { label: "下载", cls: "ghost", onClick: () => downloadText(md, "夜间打卡_" + fmtFullDate(rec.date) + ".md") },
+        { label: "完成", cls: "primary", onClick: () => { closeModal(); renderHome(); } },
+      ],
+      { size: "full" }
+    );
+  }
+
+  function showNightLog() {
+    if (!S.night.logs.length) {
+      modal(`<h3>夜间记录</h3><p class="hint">还没有记录，做一次就有了。</p>`, [{ label: "关闭", cls: "primary", onClick: closeModal }]);
+      return;
+    }
+    const rows = S.night.logs
+      .map((l, idx) => ({ l, idx }))
+      .reverse()
+      .map(({ l, idx }) => `
+        <div class="log-row">
+          <div class="log-top"><b>${fmtDate(l.date)}</b> · 晚间放松 ${l.done ? "做了" : "没做"} · 找到感觉：${l.reverseKegel}</div>
+          ${l.note ? `<div class="log-note">${l.note}</div>` : ""}
+          <div class="log-actions">
+            <button class="link" data-ncopy="${idx}">复制</button>
+            <button class="link" data-ndl="${idx}">下载</button>
+          </div>
+        </div>`)
+      .join("");
+    modal(`<h3>夜间记录（最近在上）</h3><div class="log-list">${rows}</div>`, [{ label: "关闭", cls: "primary", onClick: closeModal }], { size: "full" });
+    document.querySelectorAll("[data-ncopy]").forEach((b) => b.addEventListener("click", () => copyText(buildNightMarkdown(S.night.logs[+b.dataset.ncopy]))));
+    document.querySelectorAll("[data-ndl]").forEach((b) => b.addEventListener("click", () => { const r = S.night.logs[+b.dataset.ndl]; downloadText(buildNightMarkdown(r), "夜间打卡_" + fmtFullDate(r.date) + ".md"); }));
+  }
+
+  function wireToggle(sel) {
+    const g = $(sel);
+    if (!g) return;
+    g.querySelectorAll(".pt").forEach((b) =>
+      b.addEventListener("click", () => {
+        g.querySelectorAll(".pt").forEach((x) => x.classList.remove("active"));
+        b.classList.add("active");
+      })
+    );
+  }
+
+  function fmtClock(sec) {
+    sec = Math.max(0, sec | 0);
+    const m = Math.floor(sec / 60), s = sec % 60;
+    return m + ":" + String(s).padStart(2, "0");
+  }
+
   /* ============================ 语音安装引导 ============================ */
   function showVoiceInstall() {
     modal(
@@ -911,7 +1192,7 @@
          <li>Win 设置 → <b>辅助功能</b> → <b>讲述人</b> → 「添加更多语音」。</li>
          <li>添加中文（如 Microsoft Huihui / Kangkang）。</li>
        </ol>
-       <p class="mine">提示：微软 <b>Edge</b> 浏览器自带的在线自然语音通常更好听——用 Edge 打开本页试试。没有语音也没关系，提示音和大字流程完全够用。</p>`,
+       <p class="mine">想更好听：用微软 <b>Edge</b> 打开本页，再在主页「声音」下拉里选带 <b>Natural / 在线</b> 字样的中文语音（如"晓晓"），接近真人、免费、无需密钥。没有语音也没关系，提示音和大字流程完全够用。</p>`,
       [
         { label: "重新检测", cls: "ghost", onClick: () => { Voice.refresh(); closeModal(); renderHome(); } },
         { label: "知道了", cls: "primary", onClick: closeModal },
