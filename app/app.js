@@ -18,7 +18,11 @@
     ladders: { pushup: P.ladders.pushup.current, pullup: P.ladders.pullup.current },
     overrides: {}, // exerciseId -> 用户在 App 内改的字段（覆盖 program.js 默认值）
     night: { logs: [] }, // 夜间放松打卡（独立于力量历史，无循环/进阶）
-    settings: { voiceOn: true, rate: 1, weightStep: 1, voiceURI: null, autoAdvance: true },
+    settings: {
+      voiceOn: true, rate: 1, weightStep: 1, voiceURI: null, autoAdvance: true,
+      vol: { voice: 1, music: 0.5, tone: 0.7 }, // 语音 / 背景音乐 / 提示音 各自音量 0–1
+      musicTrack: "synth", // 背景音乐曲目（synth = 合成氛围；或 tracks.js 里 mp3 的 name）
+    },
   };
   let S = loadState();
 
@@ -27,9 +31,11 @@
       const raw = localStorage.getItem(KEY);
       if (!raw) return structuredClone(defaultState);
       const parsed = JSON.parse(raw);
-      return Object.assign(structuredClone(defaultState), parsed, {
+      const merged = Object.assign(structuredClone(defaultState), parsed, {
         settings: Object.assign({}, defaultState.settings, parsed.settings || {}),
       });
+      merged.settings.vol = Object.assign({}, defaultState.settings.vol, (parsed.settings && parsed.settings.vol) || {});
+      return merged;
     } catch (e) {
       console.warn("读取存档失败，用默认值", e);
       return structuredClone(defaultState);
@@ -66,7 +72,11 @@
         const u = new SpeechSynthesisUtterance(text);
         u.lang = "zh-CN";
         u.rate = S.settings.rate || 1;
+        u.volume = (S.settings.vol && S.settings.vol.voice != null) ? S.settings.vol.voice : 1;
         if (this.zh) u.voice = this.zh;
+        u.onstart = () => Music.duck(true);   // 说话时压低背景音乐
+        u.onend = () => Music.duck(false);
+        u.onerror = () => Music.duck(false);
         window.speechSynthesis.speak(u);
       };
       if (flush) {
@@ -110,27 +120,141 @@
   function baseExercise(menuId, exId) {
     return P.menus[menuId].exercises.find((e) => e.id === exId);
   }
-
-  let audioCtx = null;
-  function beep(freq = 880, dur = 0.15, when = 0) {
-    if (!S.settings.voiceOn) return;
-    try {
-      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-      const t = audioCtx.currentTime + when;
-      const osc = audioCtx.createOscillator();
-      const gain = audioCtx.createGain();
-      osc.frequency.value = freq;
-      osc.type = "sine";
-      gain.gain.setValueAtTime(0.001, t);
-      gain.gain.exponentialRampToValueAtTime(0.4, t + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
-      osc.connect(gain).connect(audioCtx.destination);
-      osc.start(t);
-      osc.stop(t + dur + 0.02);
-    } catch (e) {
-      /* 忽略 */
-    }
+  // 夜间步骤也套用本地覆盖（台词界面可改要点池）
+  function resolveStep(base) {
+    const ov = S.overrides[base.id];
+    return ov ? Object.assign({}, base, ov) : base;
   }
+  function findExerciseAnywhere(id) {
+    for (const m of Object.values(P.menus)) {
+      const e = m.exercises.find((x) => x.id === id);
+      if (e) return e;
+    }
+    return null;
+  }
+
+  /* ---------- 音频套件：提示音 / 呼吸音 / 背景音乐 ---------- */
+  let audioCtx = null;
+  function ensureCtx() {
+    if (!audioCtx) {
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return null; }
+    }
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+  }
+  function toneVol() { return (S.settings.vol && S.settings.vol.tone != null) ? S.settings.vol.tone : 0.7; }
+
+  // 单音（可滑音）；peak 相对音量，最终乘以"提示音"音量设置。
+  function playTone(f0, dur, when, f1, peak) {
+    const ctx = ensureCtx();
+    if (!ctx || toneVol() <= 0) return;
+    const t = ctx.currentTime + (when || 0);
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(f0, t);
+    if (f1 && f1 !== f0) osc.frequency.linearRampToValueAtTime(f1, t + dur);
+    const pk = (peak == null ? 0.4 : peak) * toneVol();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, pk), t + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(g).connect(ctx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.03);
+  }
+  function beep(freq = 880, dur = 0.15, when = 0) { playTone(freq, dur, when, null, 0.4); }
+  // 呼吸提示音：吸气上行、呼气下行（柔和偏轻）
+  function breathTone(dir) {
+    if (dir === "in") playTone(392, 0.7, 0, 587, 0.3);
+    else playTone(523, 0.9, 0, 349, 0.3);
+  }
+
+  /* ---------- 背景音乐（合成氛围 / mp3，说话时 ducking） ---------- */
+  const Music = {
+    playing: false, kind: null, nodes: null, el: null, ducked: false,
+    _baseGain() { return (S.settings.vol && S.settings.vol.music != null) ? S.settings.vol.music : 0.5; },
+    start(trackName) {
+      this.stop();
+      if (!trackName || trackName === "off" || trackName === "关闭") return;
+      const track = (window.MUSIC_TRACKS || []).find((t) => t.name === trackName)
+        || (trackName === "synth" ? { type: "synth" } : null);
+      if (!track) return;
+      const vol = this._baseGain();
+      if (vol <= 0) return;
+      if (track.type === "file" && track.file) {
+        const el = new Audio(track.file);
+        el.loop = true; el.volume = vol;
+        el.play().catch(() => {});
+        this.el = el; this.kind = "file"; this.playing = true;
+      } else {
+        const ctx = ensureCtx();
+        if (!ctx) return;
+        const master = ctx.createGain();
+        master.gain.value = vol * 0.5;
+        const lp = ctx.createBiquadFilter();
+        lp.type = "lowpass"; lp.frequency.value = 500;
+        master.connect(lp).connect(ctx.destination);
+        const freqs = [65.4, 98, 130.8];
+        const oscs = freqs.map((f, i) => {
+          const o = ctx.createOscillator();
+          o.type = i === 0 ? "sine" : "triangle";
+          o.frequency.value = f;
+          const g = ctx.createGain();
+          g.gain.value = 0.3 / (i + 1);
+          o.connect(g).connect(master);
+          o.start();
+          return o;
+        });
+        const lfo = ctx.createOscillator();
+        lfo.frequency.value = 0.08;
+        const lfoG = ctx.createGain();
+        lfoG.gain.value = vol * 0.18;
+        lfo.connect(lfoG).connect(master.gain);
+        lfo.start();
+        this.nodes = { master, oscs, lfo }; this.kind = "synth"; this.playing = true;
+      }
+      this.ducked = false;
+    },
+    stop() {
+      try {
+        if (this.el) { this.el.pause(); this.el = null; }
+        if (this.nodes) {
+          this.nodes.oscs.forEach((o) => { try { o.stop(); } catch (e) {} });
+          try { this.nodes.lfo.stop(); } catch (e) {}
+          this.nodes = null;
+        }
+      } catch (e) {}
+      this.playing = false; this.kind = null; this.ducked = false;
+    },
+    setVolume(v) {
+      if (this.kind === "file" && this.el) this.el.volume = Math.max(0, v);
+      else if (this.kind === "synth" && this.nodes) this.nodes.master.gain.value = Math.max(0, v) * 0.5;
+    },
+    duck(on) {
+      if (!this.playing || this.ducked === on) return;
+      this.ducked = on;
+      const base = this._baseGain();
+      this.setVolume(on ? base * 0.3 : base);
+    },
+  };
+
+  // 渲染层：say() —— 第二步会先查预渲染 clip，本轮直接实时 TTS（调用方不变）
+  function say(text, opts) {
+    // Phase 2 接口缝：const clip=(window.AUDIO_MANIFEST||{})[text]; if(clip) return playClip(clip,opts);
+    Voice.speak(text, opts);
+  }
+
+  /* ---------- 屏幕常亮（Wake Lock） ---------- */
+  let wakeLock = null;
+  function acquireWakeLock() {
+    try { if ("wakeLock" in navigator && !wakeLock) navigator.wakeLock.request("screen").then((w) => { wakeLock = w; }).catch(() => {}); } catch (e) {}
+  }
+  function releaseWakeLock() {
+    try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) {}
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && (session || nightSession)) acquireWakeLock();
+  });
 
   /* ============================ 进阶引擎 ============================ */
   // 依据「训练总目录」双重渐进：先加次数，到区间上限再加难度。器械固定 10kg → 用放慢离心/停顿替代加重。
@@ -180,7 +304,8 @@
   /* ============================ 会话状态 ============================ */
   let session = null; // 力量会话
   let nightSession = null; // 夜间放松会话
-  let restTimer = null, nightTimer = null, transTimer = null;
+  let restTimer = null, nightTimer = null, transTimer = null, breathTimer = null, breathTimeout = null;
+  let paused = false;
 
   function suggestedMenuId() {
     return P.meta.cycle[S.cycleIndex % P.meta.cycle.length];
@@ -204,6 +329,7 @@
       logs: {}, // exId -> [{reps,weight,rir,pain}]
       startedAt: new Date().toISOString(),
     };
+    acquireWakeLock();
     renderWarmup();
   }
 
@@ -212,6 +338,8 @@
     stopRest();
     Voice.stop();
     Voice.refresh();
+    Music.stop();
+    releaseWakeLock();
     session = null;
     nightSession = null;
     const lastLog = S.logs[S.logs.length - 1];
@@ -287,7 +415,26 @@
           <label class="toggle"><input type="checkbox" id="autoToggle" ${S.settings.autoAdvance ? "checked" : ""}/><span>⚡ 自动进行</span></label>
           <label class="rate">语速 <input type="range" id="rateRange" min="0.6" max="1.4" step="0.1" value="${S.settings.rate}"/></label>
         </div>
+        <div class="voice-pick">
+          <label>音乐</label>
+          <select id="musicSelect">${musicOptionsHtml()}</select>
+          <button class="link" id="scriptBtn">语音台词</button>
+        </div>
+        <div class="vol-grid">
+          <label>语音 <input type="range" id="volVoice" min="0" max="1" step="0.05" value="${S.settings.vol.voice}"/></label>
+          <label>音乐 <input type="range" id="volMusic" min="0" max="1" step="0.05" value="${S.settings.vol.music}"/></label>
+          <label>提示音 <input type="range" id="volTone" min="0" max="1" step="0.05" value="${S.settings.vol.tone}"/></label>
+        </div>
       </div>`;
+  }
+  function musicOptionsHtml() {
+    const cur = S.settings.musicTrack;
+    const opts = [`<option value="off" ${cur === "off" || cur === "关闭" ? "selected" : ""}>关闭</option>`];
+    (window.MUSIC_TRACKS || []).forEach((t) => {
+      const val = t.type === "synth" ? "synth" : t.name;
+      opts.push(`<option value="${escapeAttr(val)}" ${cur === val ? "selected" : ""}>${escapeHtml(t.name)}</option>`);
+    });
+    return opts.join("");
   }
   function wireVoiceSettings() {
     const sel = $("#voiceSelect");
@@ -299,6 +446,17 @@
     $("#autoToggle").addEventListener("change", (e) => { S.settings.autoAdvance = e.target.checked; saveState(); });
     const rr = $("#rateRange");
     if (rr) rr.addEventListener("change", (e) => { S.settings.rate = parseFloat(e.target.value); saveState(); Voice.test(); });
+    const ms = $("#musicSelect");
+    if (ms) ms.addEventListener("change", (e) => {
+      S.settings.musicTrack = e.target.value; saveState();
+      Music.start(S.settings.musicTrack);
+      if (!nightSession) setTimeout(() => { if (!nightSession) Music.stop(); }, 3000); // 主页试听 3 秒
+    });
+    const vv = $("#volVoice"); if (vv) vv.addEventListener("input", (e) => { S.settings.vol.voice = parseFloat(e.target.value); saveState(); });
+    const vm = $("#volMusic"); if (vm) vm.addEventListener("input", (e) => { S.settings.vol.music = parseFloat(e.target.value); saveState(); Music.setVolume(Music._baseGain()); });
+    const vt = $("#volTone"); if (vt) vt.addEventListener("input", (e) => { S.settings.vol.tone = parseFloat(e.target.value); saveState(); });
+    const vtc = $("#volTone"); if (vtc) vtc.addEventListener("change", () => beep(660, 0.12)); // 松手试听提示音
+    const sb = $("#scriptBtn"); if (sb) sb.addEventListener("click", showScript);
   }
 
   /* ============================ 视图：力量子首页（选菜单） ============================ */
@@ -569,7 +727,7 @@
     const total = remain;
     const nextSetNo = session.setIndex + 2; // 下一组编号
     beep(660, 0.12);
-    Voice.speak("休息 " + remain + " 秒", { flush: true });
+    say("休息 " + remain + " 秒", { flush: true });
 
     app.innerHTML = `
       <section class="screen rest">
@@ -584,6 +742,7 @@
         </div>
         <div class="next-up">下一组：${ex.name} 第 ${nextSetNo}/${ex.sets} 组</div>
         <div class="btn-row">
+          <button class="btn ghost" id="restPause">⏸ 暂停</button>
           <button class="btn ghost" id="add30">+30s</button>
           <button class="btn primary" id="skipRest">跳过 · 开始下一组</button>
         </div>
@@ -600,11 +759,12 @@
 
     stopRest();
     restTimer = setInterval(() => {
+      if (paused) return;
       remain--;
       if (remain === 10) {
         beep(620, 0.12); // 十秒警告：双低音
         beep(620, 0.12, 0.18);
-        Voice.speak("还有十秒", { flush: true });
+        say("还有十秒", { flush: true });
       }
       if (remain <= 3 && remain > 0) beep(700, 0.08);
       if (remain <= 0) {
@@ -617,6 +777,7 @@
       paint();
     }, 1000);
 
+    $("#restPause").addEventListener("click", () => togglePause("#restPause"));
     $("#add30").addEventListener("click", () => {
       remain += 30;
       paint();
@@ -629,13 +790,25 @@
 
   function finishRest(ex) {
     session.setIndex++;
-    Voice.speak("开始下一组，" + ex.name + "，第 " + (session.setIndex + 1) + " 组", { flush: true });
+    say("开始下一组，" + ex.name + "，第 " + (session.setIndex + 1) + " 组", { flush: true });
     renderPlayer();
   }
 
   function stopRest() {
-    [restTimer, nightTimer, transTimer].forEach((t) => t && clearInterval(t));
-    restTimer = nightTimer = transTimer = null;
+    [restTimer, nightTimer, transTimer, breathTimer].forEach((t) => t && clearInterval(t));
+    if (breathTimeout) clearTimeout(breathTimeout);
+    restTimer = nightTimer = transTimer = breathTimer = breathTimeout = null;
+    paused = false;
+  }
+
+  // 暂停/继续：计时器空转不推进、呼吸调度跳过、暂停 CSS 动画、停住在说的话
+  function togglePause(labelSel) {
+    paused = !paused;
+    const scr = $(".screen");
+    if (scr) scr.classList.toggle("is-paused", paused);
+    if (paused) { Voice.stop(); Music.duck(false); }
+    const btn = labelSel && $(labelSel);
+    if (btn) btn.textContent = paused ? "▶ 继续" : "⏸ 暂停";
   }
 
   /* ---------- 动作切换 ---------- */
@@ -993,46 +1166,76 @@
     stopRest();
     Voice.stop();
     nightSession = { stepIndex: 0, startedAt: new Date().toISOString(), skipped: {}, remain: 0 };
+    acquireWakeLock();
+    Music.start(S.settings.musicTrack);
     renderNightStep();
   }
 
   function renderNightStep() {
     stopRest();
     const steps = P.night.steps;
-    const step = steps[nightSession.stepIndex];
+    const step = resolveStep(steps[nightSession.stepIndex]);
     const idx = nightSession.stepIndex;
     const isBreath = step.type === "breath" || step.type === "release";
     const isRelease = step.type === "release";
-    Voice.speak(step.name + "。" + step.cue, { flush: true });
     const li = (a) => (a || []).map((x) => `<li>${x}</li>`).join("");
+    // 闭眼锻炼：屏幕极简，只留步骤名 + 倒计时给偶尔一瞥；引导全靠声音（提示音+语音）。做法收进"睁眼看"。
     app.innerHTML = `
-      <section class="screen night">
+      <section class="screen night eyes-free">
         <div class="crumb"><button class="link back" id="nightExit">‹ 退出</button><span>🌙 夜间放松 ${idx + 1}/${steps.length}</span></div>
-        <div class="ex-id">${step.id}</div>
-        <h1 class="ex-name">${step.name}</h1>
+        <h1 class="ex-name night-name">${step.name}</h1>
         <div class="ring-wrap night-ring">
           <svg viewBox="0 0 200 200" class="ring"><circle class="ring-bg" cx="100" cy="100" r="90"/><circle class="ring-fg" cx="100" cy="100" r="90" id="nightRingFg"/></svg>
-          ${isBreath ? `<div class="breath-circle ${isRelease ? "release" : ""}"></div>` : ""}
           <div class="ring-num" id="nightNum">${fmtClock(step.seconds)}</div>
         </div>
-        ${isBreath ? `<div class="breath-labels"><span class="breath-in">${isRelease ? "吸气 · 松开" : "吸气"}</span><span class="breath-out">${isRelease ? "呼气 · 归位" : "呼气"}</span></div>` : ""}
-        <div class="night-cue">💡 ${step.cue}</div>
-        <div class="howto small">
-          <ol class="howto-steps">${li(step.how)}</ol>
-          <div class="feel-row">
-            ${step.feelGood ? `<div class="feel good">✅ ${step.feelGood}</div>` : ""}
-            ${step.pitfalls ? `<div class="feel bad">🚫 ${step.pitfalls}</div>` : ""}
-          </div>
-        </div>
         <div class="btn-row">
+          <button class="btn ghost" id="nightPause">⏸ 暂停</button>
           <button class="btn ghost" id="nightAdd">+30s</button>
           <button class="btn ghost" id="nightSkip">${step.skippable ? "膝不适 · 跳过" : "跳过这步"}</button>
         </div>
+        <button class="link night-how" id="nightHow">做法（睁眼看）</button>
       </section>`;
     $("#nightExit").addEventListener("click", () => { stopRest(); nightSession = null; renderHome(); });
+    $("#nightPause").addEventListener("click", () => togglePause("#nightPause"));
     $("#nightAdd").addEventListener("click", () => { nightSession.remain += 30; const el = $("#nightNum"); if (el) el.textContent = fmtClock(nightSession.remain); });
     $("#nightSkip").addEventListener("click", () => { nightSession.skipped[step.id] = true; stopRest(); nextNightStep(); });
+    $("#nightHow").addEventListener("click", () => {
+      modal(
+        `<h3>${step.id} · ${step.name}</h3>
+         <div class="night-cue">💡 ${step.cue}</div>
+         <ol class="howto-steps">${li(step.how)}</ol>
+         <div class="feel-row">
+           ${step.feelGood ? `<div class="feel good">✅ ${step.feelGood}</div>` : ""}
+           ${step.pitfalls ? `<div class="feel bad">🚫 ${step.pitfalls}</div>` : ""}
+         </div>`,
+        [{ label: "知道了", cls: "primary", onClick: closeModal }],
+        { size: "full" }
+      );
+    });
     startNightTimer(step);
+    say(step.name, { flush: true }); // 说一次步骤名
+    if (isBreath) startBreathCoach(step);
+  }
+
+  // 夜间呼吸引导（纯听觉）：吸气上行提示音、呼气下行提示音打节拍；呼气间隙随机念一句要点（语音只念要点，不念吸呼）
+  function startBreathCoach(step) {
+    const b = step.breath || { inhale: 4, exhale: 6 };
+    const pts = step.points || [];
+    let ci = Math.floor(Math.random() * Math.max(1, pts.length)); // 起点随机
+    let first = true;
+    const cycleMs = (b.inhale + b.exhale) * 1000;
+    const tick = () => {
+      if (paused) return;
+      breathTone("in");
+      breathTimeout = setTimeout(() => {
+        if (paused) return;
+        breathTone("out");
+        if (!first && pts.length) say(pts[ci++ % pts.length], { flush: true }); // 呼气间隙念要点
+        first = false;
+      }, b.inhale * 1000);
+    };
+    tick();
+    breathTimer = setInterval(tick, cycleMs);
   }
 
   function startNightTimer(step) {
@@ -1049,15 +1252,13 @@
     };
     paint();
     nightTimer = setInterval(() => {
+      if (paused) return;
       nightSession.remain--;
       if (nightSession.remain <= 0) {
         stopRest();
-        beep(784, 0.16);
-        beep(1046, 0.22, 0.14);
         nextNightStep();
         return;
       }
-      if (nightSession.remain === 10 && nightSession.stepIndex < P.night.steps.length - 1) beep(660, 0.1);
       paint();
     }, 1000);
   }
@@ -1364,6 +1565,66 @@
       const p = (n) => String(n).padStart(2, "0");
       return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
     } catch (e) { return iso; }
+  }
+
+  /* ============================ 语音台词（检视 + 编辑） ============================ */
+  function showScript() {
+    const exRows = [];
+    Object.values(P.menus).forEach((m) => m.exercises.forEach((base) => {
+      const ex = resolveEx(base);
+      exRows.push(`<div class="sc-row"><label>${ex.id} ${ex.name}</label><input type="text" class="text-in" data-cue="${ex.id}" value="${escapeAttr(ex.voiceCue || "")}"/></div>`);
+    }));
+    const nightRows = P.night.steps.map((base) => {
+      const s = resolveStep(base);
+      return `<div class="sc-row col"><label>${s.id} ${s.name} · 要点（每行一句，呼气间隙随机念）</label><textarea class="text-in" rows="5" data-pts="${s.id}">${escapeHtml((s.points || []).join("\n"))}</textarea></div>`;
+    }).join("");
+    const sys = ["休息 N 秒 / 还有十秒 / 开始下一组", "下一个，<动作名>", "全部完成，做得好 / 训练结束", "放松完成，做完直接睡吧 / 已记录，晚安"];
+    modal(
+      `<div class="script-view">
+        <h3>🗣 语音台词</h3>
+        <p class="hint">这里是会念给你听的内容，可改；改完立刻生效（实时语音兜底，无需重生成）。系统提示暂只读。</p>
+        <h4>力量 · 每个动作的提醒</h4>${exRows.join("")}
+        <h4>夜间 · 每步要点池</h4>${nightRows}
+        <h4>系统提示（只读）</h4><ul class="rules">${sys.map((x) => `<li>${x}</li>`).join("")}</ul>
+      </div>`,
+      [
+        { label: "恢复默认", cls: "ghost", onClick: clearScriptOverrides },
+        { label: "保存", cls: "primary", onClick: saveScript },
+      ],
+      { size: "full" }
+    );
+  }
+  function ensureOverride(id) { if (!S.overrides[id]) S.overrides[id] = {}; }
+  function cleanOverride(id) { if (S.overrides[id] && Object.keys(S.overrides[id]).length === 0) delete S.overrides[id]; }
+  function saveScript() {
+    document.querySelectorAll("[data-cue]").forEach((inp) => {
+      const id = inp.dataset.cue, v = inp.value.trim();
+      const base = findExerciseAnywhere(id);
+      ensureOverride(id);
+      if (base && v && v !== base.voiceCue) S.overrides[id].voiceCue = v;
+      else delete S.overrides[id].voiceCue;
+      cleanOverride(id);
+    });
+    document.querySelectorAll("[data-pts]").forEach((ta) => {
+      const id = ta.dataset.pts;
+      const lines = ta.value.split("\n").map((s) => s.trim()).filter(Boolean);
+      const base = P.night.steps.find((s) => s.id === id);
+      ensureOverride(id);
+      if (base && JSON.stringify(lines) !== JSON.stringify(base.points || [])) S.overrides[id].points = lines;
+      else delete S.overrides[id].points;
+      cleanOverride(id);
+    });
+    saveState();
+    closeModal();
+    toast("已保存", "台词改动已生效。");
+  }
+  function clearScriptOverrides() {
+    Object.keys(S.overrides).forEach((id) => {
+      if (S.overrides[id]) { delete S.overrides[id].voiceCue; delete S.overrides[id].points; cleanOverride(id); }
+    });
+    saveState();
+    closeModal();
+    toast("已恢复默认", "台词已还原为出厂内容。");
   }
 
   /* ============================ 启动 ============================ */
