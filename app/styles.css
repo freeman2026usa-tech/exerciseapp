@@ -292,6 +292,12 @@ input[type=number]::-webkit-inner-spin-button { opacity: 1; }
 
 /* ---------- 夜间放松 ---------- */
 .night .ex-name { color: #cbb8ff; }
+/* 闭眼锻炼：夜间屏幕极简、居中 */
+.night.eyes-free { text-align: center; display: flex; flex-direction: column; align-items: center; }
+.night.eyes-free .crumb { width: 100%; }
+.night-name { margin-top: 24px; }
+.night.eyes-free .btn-row { width: 100%; max-width: 460px; }
+.night-how { margin-top: 22px; opacity: .7; }
 .night-ring { margin: 14px auto 4px; }
 .night-ring .ring-fg { stroke: #9a7bff; }
 .night-ring .ring-num { font-size: clamp(44px, 12vw, 78px); }
@@ -325,7 +331,29 @@ input[type=number]::-webkit-inner-spin-button { opacity: 1; }
   0%, 40% { opacity: .18; } 47%, 100% { opacity: 1; }
 }
 
+/* ---------- 音量三滑块 ---------- */
+.vol-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.vol-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--dim); }
+.vol-grid input[type="range"] { accent-color: var(--accent2); width: 100%; }
+.voice-pick #musicSelect { flex: 1; }
+
+/* ---------- 语音台词界面 ---------- */
+.script-view h4 { margin: 16px 0 8px; font-size: 16px; color: var(--accent2); }
+.sc-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.sc-row > label { flex: none; width: 40%; font-size: 14px; color: var(--dim); }
+.sc-row > .text-in { flex: 1; }
+.sc-row.col { flex-direction: column; align-items: stretch; }
+.sc-row.col > label { width: auto; margin-bottom: 4px; }
+.sc-row textarea.text-in { resize: vertical; font-family: inherit; line-height: 1.6; }
+
+/* ---------- 暂停：停住动画 + 提示 ---------- */
+.screen.is-paused .breath-circle,
+.screen.is-paused .breath-in,
+.screen.is-paused .breath-out { animation-play-state: paused; }
+.screen.is-paused .ring-num::after { content: " ⏸"; font-size: .5em; color: var(--dim); }
+
 @media (max-width: 420px) {
   .menu-btns { grid-template-columns: repeat(2, 1fr); }
   .btn-row .btn { min-width: calc(50% - 6px); }
+  .vol-grid { grid-template-columns: 1fr; }
 }
