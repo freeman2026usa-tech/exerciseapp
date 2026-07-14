@@ -19,7 +19,7 @@
     overrides: {}, // exerciseId -> 用户在 App 内改的字段（覆盖 program.js 默认值）
     night: { logs: [] }, // 夜间放松打卡（独立于力量历史，无循环/进阶）
     settings: {
-      voiceOn: true, rate: 1, weightStep: 1, voiceURI: null, autoAdvance: true,
+      voiceOn: true, rate: 1, weightStep: 1, voiceURI: null, autoAdvance: true, nightVoice: null,
       vol: { voice: 1, music: 0.5, tone: 0.7 }, // 语音 / 背景音乐 / 提示音 各自音量 0–1
       musicTrack: "off", // 背景音乐：off=关闭（默认）；synth=生成式轻音；或 tracks.js 里 mp3 的 name
     },
@@ -297,6 +297,14 @@
     } catch (e) { Voice.speak(text, opts); }
   }
 
+  // 多音色可切换：按设置里选定的「夜间语音」，切换 say() 命中的 clip 集（不影响力量训练的 TTS）
+  function applyNightVoice() {
+    const byV = window.AUDIO_MANIFEST_BY_VOICE;
+    if (!byV) return; // 单音色/未烧：保持 manifest.js 里已设的 window.AUDIO_MANIFEST
+    const key = S.settings.nightVoice || window.AUDIO_MANIFEST_DEFAULT;
+    if (key && byV[key]) window.AUDIO_MANIFEST = byV[key];
+  }
+
   /* ---------- 屏幕常亮（Wake Lock） ---------- */
   let wakeLock = null;
   function acquireWakeLock() {
@@ -474,12 +482,24 @@
           <label>音乐</label>
           <select id="musicSelect">${musicOptionsHtml()}</select>
         </div>
+        ${(window.AUDIO_MANIFEST_VOICES && window.AUDIO_MANIFEST_VOICES.length) ? `
+        <div class="voice-pick">
+          <label>🌙 夜间语音</label>
+          <select id="nightVoiceSelect">${nightVoiceOptionsHtml()}</select>
+        </div>` : ""}
         <div class="vol-grid">
           <label>语音 <input type="range" id="volVoice" min="0" max="1" step="0.05" value="${S.settings.vol.voice}"/></label>
           <label>音乐 <input type="range" id="volMusic" min="0" max="1" step="0.05" value="${S.settings.vol.music}"/></label>
           <label>提示音 <input type="range" id="volTone" min="0" max="1" step="0.05" value="${S.settings.vol.tone}"/></label>
         </div>
       </div>`;
+  }
+  function nightVoiceOptionsHtml() {
+    const list = window.AUDIO_MANIFEST_VOICES || [];
+    const cur = S.settings.nightVoice || window.AUDIO_MANIFEST_DEFAULT;
+    return list
+      .map((v) => `<option value="${escapeAttr(v.key)}" ${cur === v.key ? "selected" : ""}>${escapeHtml(v.name)}</option>`)
+      .join("");
   }
   function musicOptionsHtml() {
     const cur = S.settings.musicTrack;
@@ -500,6 +520,15 @@
     $("#autoToggle").addEventListener("change", (e) => { S.settings.autoAdvance = e.target.checked; saveState(); });
     const rr = $("#rateRange");
     if (rr) rr.addEventListener("change", (e) => { S.settings.rate = parseFloat(e.target.value); saveState(); Voice.test(); });
+    const nvs = $("#nightVoiceSelect");
+    if (nvs) nvs.addEventListener("change", (e) => {
+      S.settings.nightVoice = e.target.value; applyNightVoice(); saveState();
+      // 试听一句所选夜间语音
+      try {
+        const m = window.AUDIO_MANIFEST, p = m && m["闭上眼，让床把你接住。"];
+        if (p) { const a = new Audio(p); a.volume = (S.settings.vol && S.settings.vol.voice != null) ? S.settings.vol.voice : 1; a.play().catch(() => {}); }
+      } catch (_) {}
+    });
     const ms = $("#musicSelect");
     if (ms) ms.addEventListener("change", (e) => {
       S.settings.musicTrack = e.target.value; saveState();
@@ -1712,5 +1741,6 @@
   }
 
   /* ============================ 启动 ============================ */
+  applyNightVoice(); // 按已保存的夜间语音选择，指向对应音色的 clip 集
   renderHome();
 })();
