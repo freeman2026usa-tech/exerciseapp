@@ -357,7 +357,7 @@
   /* ============================ 会话状态 ============================ */
   let session = null; // 力量会话
   let nightSession = null; // 夜间放松会话
-  let restTimer = null, nightTimer = null, transTimer = null, breathTimer = null, breathTimeout = null;
+  let restTimer = null, nightTimer = null, transTimer = null, breathTimer = null, breathTimeout = null, introTimer = null;
   let paused = false;
 
   function suggestedMenuId() {
@@ -850,7 +850,8 @@
   function stopRest() {
     [restTimer, nightTimer, transTimer, breathTimer].forEach((t) => t && clearInterval(t));
     if (breathTimeout) clearTimeout(breathTimeout);
-    restTimer = nightTimer = transTimer = breathTimer = breathTimeout = null;
+    if (introTimer) clearTimeout(introTimer);
+    restTimer = nightTimer = transTimer = breathTimer = breathTimeout = introTimer = null;
     paused = false;
   }
 
@@ -1215,13 +1216,23 @@
   });
 
   /* ============================ 夜间放松板块 ============================ */
+  // 从台词池随机取一句（intro/outro 用）
+  function pickLine(arr) { return (arr && arr.length) ? arr[Math.floor(Math.random() * arr.length)] : null; }
+
   function startNight() {
     stopRest();
     Voice.stop();
     nightSession = { stepIndex: 0, startedAt: new Date().toISOString(), skipped: {}, remain: 0 };
     acquireWakeLock();
     Music.start(S.settings.musicTrack);
-    renderNightStep();
+    // 开场句先念完，隔一会儿再进 E1（否则会被第一步的引导语冲掉）
+    const intro = S.settings.voiceOn ? pickLine(P.night.intro) : null;
+    if (intro) {
+      say(intro, { flush: true });
+      introTimer = setTimeout(() => { introTimer = null; if (nightSession) renderNightStep(); }, 4200);
+    } else {
+      renderNightStep();
+    }
   }
 
   function renderNightStep() {
@@ -1330,7 +1341,7 @@
 
   function finishNight() {
     stopRest();
-    Voice.speak("放松完成，做完直接睡吧。", { flush: true });
+    say(pickLine(P.night.outro) || "放松完成，做完直接睡吧。", { flush: true });
     app.innerHTML = `
       <section class="screen summary night-summary">
         <h2>🌙 放松完成</h2>
@@ -1372,7 +1383,7 @@
     };
     S.night.logs.push(rec);
     saveState();
-    Voice.speak("已记录，晚安。", { flush: true });
+    say("已记录，晚安。", { flush: true });
     nightSession = null;
     showNightExport(rec);
   }

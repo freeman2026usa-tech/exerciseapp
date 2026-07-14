@@ -1,12 +1,65 @@
 /*
- * app/audio/manifest.js —— 预渲染音频清单（渲染层接口缝的第 1 优先级）
- *
- * 现在是空的：say() 查不到 clip，就退回运行时大模型适配器 window.AI_TTS（默认无），
- * 再退回浏览器实时 TTS。功能完全正常。
- *
- * 「换大模型渲染音频」= Phase 2：跑生成脚本（edge-tts / OpenAI / ElevenLabs 任选），
- * 把固定台词逐句渲染成 mp3，并在这里填成：
- *   window.AUDIO_MANIFEST = { "腹式呼吸": "audio/clips/xxxx.mp3", "呼比吸长": "audio/clips/yyyy.mp3", ... };
- * App 代码一个字都不用改，say() 命中即用预渲染音频。
+ * app/audio/manifest.js —— 预渲染音频清单（渲染层接口缝 say() 的第 1 优先级）。
+ * 自动生成，勿手改；改台词/换音色请重跑 scripts/gen_audio_night.py。
+ * 音色：Seren（qwen3-tts-flash）· 仅夜间放松；力量训练仍走浏览器 TTS。
  */
-// window.AUDIO_MANIFEST = {};
+window.AUDIO_MANIFEST = {
+  "躺好，把今天先放到一边。": "audio/clips/841756eb77fd.wav",
+  "接下来这十分钟，只属于你。": "audio/clips/7e54ed2cb44f.wav",
+  "灯关小一点，手机放远一点。": "audio/clips/42b3b3eaa7e2.wav",
+  "不用做对，只要放松就好。": "audio/clips/a55e01f271ce.wav",
+  "闭上眼，让床把你接住。": "audio/clips/dc8962840f3d.wav",
+  "腹式呼吸": "audio/clips/73b346674eaa.wav",
+  "腹式呼吸。跟着提示音走，升调吸气，降调呼气。": "audio/clips/9c688e8a877c.wav",
+  "呼比吸长": "audio/clips/b5b9db751648.wav",
+  "呼气再放长一点": "audio/clips/e7e5518d8a98.wav",
+  "把气慢慢送出去": "audio/clips/a7a222071bd5.wav",
+  "长呼气，把自己放下来": "audio/clips/f81b59f38de1.wav",
+  "全身往下沉": "audio/clips/04e2adf91754.wav",
+  "每一次呼气，多沉一点": "audio/clips/e76b72e4a59f.wav",
+  "让肚子轻轻起伏就好": "audio/clips/dbc4e026aa10.wav",
+  "肚子鼓起来，再慢慢落下去": "audio/clips/13ac2cfd4b73.wav",
+  "肩膀放松": "audio/clips/4e1f89b05511.wav",
+  "让肩膀离开耳朵": "audio/clips/6b3471f57108.wav",
+  "眉头松开、下巴松开": "audio/clips/9230c8e27a37.wav",
+  "心跳慢下来": "audio/clips/1a23e3fddba7.wav",
+  "不用数，跟着提示音就好": "audio/clips/5bae05d3f371.wav",
+  "别急，慢慢来": "audio/clips/5ef1820a4a44.wav",
+  "反向凯格尔": "audio/clips/62e5145c20f0.wav",
+  "反向凯格尔。跟着提示音走，升调吸气，降调呼气。": "audio/clips/a57e8b57fcf1.wav",
+  "把会阴放开、下沉": "audio/clips/37f0937e630e.wav",
+  "吸气时，轻轻放行": "audio/clips/48a9f9b225c9.wav",
+  "力度只要一两成": "audio/clips/d5cf57f1029e.wav",
+  "只用一点点意念，不用使劲": "audio/clips/42dcc099dd3d.wav",
+  "别憋气、别往下顶": "audio/clips/e9d47f39a225.wav",
+  "像快尿出来前那一下的松": "audio/clips/532735b6d433.wav",
+  "像松开一只握紧的手": "audio/clips/7c86e571267c.wav",
+  "那一圈，让它软下来": "audio/clips/af34f2d17b61.wav",
+  "呼气时什么都不做": "audio/clips/68d09528c0ef.wav",
+  "找不到？很正常，别急": "audio/clips/35f15d05d6e8.wav",
+  "越想找越紧，先别找，先松": "audio/clips/56845a4cd95d.wav",
+  "越松越好": "audio/clips/40b67b257cfc.wav",
+  "快乐婴儿式": "audio/clips/44ae570f8781.wav",
+  "膝盖拉向腋窝": "audio/clips/85f87216a53b.wav",
+  "抓住脚，轻轻往下带": "audio/clips/816006214e45.wav",
+  "继续慢慢呼吸": "audio/clips/2012c0e6cbee.wav",
+  "到舒服就停、别硬拽": "audio/clips/d7cec2d61b78.wav",
+  "拉到刚好就停，不用更多": "audio/clips/1e902f6b6988.wav",
+  "会阴一带被打开": "audio/clips/461c1eb125d4.wav",
+  "髋和下腰也松开": "audio/clips/083c14994319.wav",
+  "呼气时，往地面沉一点": "audio/clips/068a4329a2b5.wav",
+  "深蹲停留": "audio/clips/f97c55c51a5f.wav",
+  "脚跟踩实": "audio/clips/40be3d3d1c04.wav",
+  "脚踏实，重心往下坐": "audio/clips/a3894a943157.wav",
+  "髋和会阴沉下去": "audio/clips/9d784682cd9b.wav",
+  "让髋沉到最低": "audio/clips/e4228e7b8b0a.wav",
+  "蹲不住就扶着": "audio/clips/13876d52fe70.wav",
+  "膝不舒服就起来，别忍": "audio/clips/277419890ff0.wav",
+  "最后一步了，松松地呼吸": "audio/clips/a55235fe2517.wav",
+  "深呼吸，别硬撑": "audio/clips/a3a8ffb87fff.wav",
+  "放松完成，做完直接睡吧。": "audio/clips/761efe09dddb.wav",
+  "做完了，就这样睡过去。": "audio/clips/4e8dd4e5fd1d.wav",
+  "都松开了，让自己继续沉下去。": "audio/clips/d86640a45148.wav",
+  "结束了，别碰手机，睡吧。": "audio/clips/57357334b430.wav",
+  "已记录，晚安。": "audio/clips/2e86890b1b65.wav"
+};
