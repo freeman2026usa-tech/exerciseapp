@@ -292,12 +292,13 @@ input[type=number]::-webkit-inner-spin-button { opacity: 1; }
 
 /* ---------- 夜间放松 ---------- */
 .night .ex-name { color: #cbb8ff; }
-/* 闭眼锻炼：夜间屏幕极简、居中 */
-.night.eyes-free { text-align: center; display: flex; flex-direction: column; align-items: center; }
-.night.eyes-free .crumb { width: 100%; }
+/* 闭眼锻炼：夜间屏幕极简、居中。
+   用「块 + text-align:center」（与组间休息屏 .rest 一致），不用 flex 列——
+   避免 .ring-wrap 的 aspect-ratio 在 flex 列里塌高、导致绝对定位的大号倒计时压到相邻元素。 */
+.night.eyes-free { text-align: center; }
 .night-name { margin-top: 24px; }
-.night.eyes-free .btn-row { width: 100%; max-width: 460px; }
-.night-how { margin-top: 22px; opacity: .7; }
+.night.eyes-free .btn-row { max-width: 460px; margin-left: auto; margin-right: auto; justify-content: center; }
+.night-how { display: inline-block; margin-top: 22px; opacity: .7; }
 .night-ring { margin: 14px auto 4px; }
 .night-ring .ring-fg { stroke: #9a7bff; }
 .night-ring .ring-num { font-size: clamp(44px, 12vw, 78px); }
@@ -337,10 +338,13 @@ input[type=number]::-webkit-inner-spin-button { opacity: 1; }
 .vol-grid input[type="range"] { accent-color: var(--accent2); width: 100%; }
 .voice-pick #musicSelect { flex: 1; }
 
-/* ---------- 语音台词界面 ---------- */
-.script-view h4 { margin: 16px 0 8px; font-size: 16px; color: var(--accent2); }
+/* ---------- 锻炼提示词界面 ---------- */
+.link.strong { color: var(--accent); font-weight: 700; }
+.script-view h4 { margin: 18px 0 8px; font-size: 16px; color: var(--accent2); }
+.sc-block { border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 10px; }
 .sc-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.sc-row > label { flex: none; width: 40%; font-size: 14px; color: var(--dim); }
+.sc-row > label { flex: none; width: 42%; font-size: 14px; color: var(--dim); }
+.sc-row > label.sub { font-size: 13px; opacity: .8; }
 .sc-row > .text-in { flex: 1; }
 .sc-row.col { flex-direction: column; align-items: stretch; }
 .sc-row.col > label { width: auto; margin-bottom: 4px; }
