@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-夜间放松台词 —— 把 7 把终选音色各烧一整套 58 条 clip，写成「可切换」的 manifest.js。
+夜间放松台词 —— 把定稿音色 Seren 烧一整套 clip，写成 manifest.js（VOICES 可扩展多把）。
 台词来自 scripts/night_strings.json（由 scripts/night_strings.js 从 program.js 精确提取，勿手改）。
 每把音色一个子目录 app/audio/clips/<key>/；已存在的 clip 按文本 md5 跳过（断点续烧，可反复跑补齐）。
 两套引擎：
   - Seren / 卡捷琳娜 走 qwen3-tts-flash（SDK）；
-  - 5 把定制走声音设计合成 qwen3-tts-vd-2026-01-26（HTTP，voice id 取自 scripts/custom_voice_id_<key>.txt）。
+  - 定制音色走声音设计合成 qwen3-tts-vd-2026-01-26（HTTP，voice id 取自 scripts/custom_voice_id_<key>.txt）。
 用法(cmd):  set DASHSCOPE_API_KEY=sk-...   然后  python scripts/gen_audio_night.py
 key 仅经环境变量传入，绝不写进任何文件、绝不提交。
 """
@@ -40,13 +40,7 @@ STRINGS = os.path.join(HERE, "night_strings.json")
 DEFAULT_VOICE = "seren"
 # key, 显示名, engine(qwen|vd), qwen 用的 voice 名（vd 忽略，改读 custom_voice_id_<key>.txt）
 VOICES = [
-    ("seren",    "Seren",    "qwen", "Seren"),
-    ("katerina", "卡捷琳娜", "qwen", "Katerina"),
-    ("jingshu",  "静姝",     "vd",   None),
-    ("ruanmian", "软眠",     "vd",   None),
-    ("nuanyi",   "暖依",     "vd",   None),
-    ("hexu",     "和煦",     "vd",   None),
-    ("qingyu",   "轻语",     "vd",   None),
+    ("seren", "Seren", "qwen", "Seren"),  # 定稿只用 Seren；要多把再往下加即可
 ]
 
 if not os.path.exists(STRINGS):
