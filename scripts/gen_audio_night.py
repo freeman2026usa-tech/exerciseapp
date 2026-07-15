@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-夜间放松台词 —— 把 7 把终选音色各烧一整套 58 条 clip，写成「可切换」的 manifest.js。
+夜间放松台词 —— 把定稿音色 Seren 烧一整套 clip，写成 manifest.js（VOICES 可扩展多把）。
 台词来自 scripts/night_strings.json（由 scripts/night_strings.js 从 program.js 精确提取，勿手改）。
 每把音色一个子目录 app/audio/clips/<key>/；已存在的 clip 按文本 md5 跳过（断点续烧，可反复跑补齐）。
 两套引擎：
   - Seren / 卡捷琳娜 走 qwen3-tts-flash（SDK）；
-  - 5 把定制走声音设计合成 qwen3-tts-vd-2026-01-26（HTTP，voice id 取自 scripts/custom_voice_id_<key>.txt）。
+  - 定制音色走声音设计合成 qwen3-tts-vd-2026-01-26（HTTP，voice id 取自 scripts/custom_voice_id_<key>.txt）。
 用法(cmd):  set DASHSCOPE_API_KEY=sk-...   然后  python scripts/gen_audio_night.py
 key 仅经环境变量传入，绝不写进任何文件、绝不提交。
 """
@@ -38,6 +38,7 @@ MANIFEST = os.path.join(ROOT, "app", "audio", "manifest.js")
 STRINGS = os.path.join(HERE, "night_strings.json")
 
 DEFAULT_VOICE = "seren"
+BURN = {"seren"}  # 本轮只合成这些音色；其余音色沿用现有 manifest 里的旧映射（切过去改动句回退 TTS）
 # key, 显示名, engine(qwen|vd), qwen 用的 voice 名（vd 忽略，改读 custom_voice_id_<key>.txt）
 VOICES = [
     ("seren",    "Seren",    "qwen", "Seren"),
@@ -140,28 +141,45 @@ def burn_voice(key, name, engine, qvoice):
     return m, fails
 
 
+def load_base_by_voice():
+    # 读现有 manifest.js 里的 AUDIO_MANIFEST_BY_VOICE（保留本轮不烧的音色映射）
+    if not os.path.exists(MANIFEST):
+        return {}
+    txt = open(MANIFEST, encoding="utf-8").read()
+    marker = "window.AUDIO_MANIFEST_BY_VOICE = "
+    if marker not in txt:
+        return {}
+    start = txt.index(marker) + len(marker)
+    try:
+        end = txt.index(";\nwindow.AUDIO_MANIFEST_VOICES", start)
+        return json.loads(txt[start:end])
+    except Exception:
+        return {}
+
+
 def main():
     os.makedirs(CLIPS, exist_ok=True)
-    print("待烧 %d 条 × %d 把音色 = %d 次（已存在的跳过）" % (
-        len(TEXTS), len(VOICES), len(TEXTS) * len(VOICES)))
+    base = load_base_by_voice()
+    print("待烧 %d 条 · 本轮合成音色: %s（其余沿用现有映射）" % (len(TEXTS), ", ".join(sorted(BURN))))
     by_voice = {}
     voices_meta = []
-    incomplete = []
     for key, name, engine, qvoice in VOICES:
-        m, fails = burn_voice(key, name, engine, qvoice)
-        by_voice[key] = m
-        if len(m) == len(TEXTS):
-            voices_meta.append({"key": key, "name": name})
+        if key in BURN:
+            m, fails = burn_voice(key, name, engine, qvoice)
+            if fails:
+                print("!! %s(%s) 有 %d 条失败，未写 manifest（修好再跑）" % (name, key, len(fails)))
+                return 2
         else:
-            incomplete.append(name)
+            m = base.get(key, {})
+            print(">> %-9s(%s) 沿用现有映射 %d 条（未重烧）" % (name, key, len(m)))
+        by_voice[key] = m
+        if m:
+            voices_meta.append({"key": key, "name": name})
 
     if DEFAULT_VOICE not in [v["key"] for v in voices_meta]:
-        print("!! 默认音色 %s 未烧全，暂不写 manifest（补齐后重跑）" % DEFAULT_VOICE)
+        print("!! 默认音色 %s 无映射，停止" % DEFAULT_VOICE)
         return 2
-    if incomplete:
-        print("!! 未烧全（本次不列入选择器）：" + "、".join(incomplete) + " —— 重跑可补齐")
 
-    # 只写「已烧全」的音色，避免选择器里出现放不出声的死音色
     good = {v["key"]: by_voice[v["key"]] for v in voices_meta}
     header = (
         "/*\n"

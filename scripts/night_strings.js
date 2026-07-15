@@ -16,14 +16,17 @@ const set = new Set();
 // 开场句（startNight）
 (night.intro || []).forEach((s) => set.add(s));
 
-night.steps.forEach((step, i) => {
-  // 步骤名：非首个呼吸步直接念名（renderNightStep else 分支）
-  set.add(step.name);
-  // 首个呼吸步的引导长句（renderNightStep if 分支）——E1 实际触发；E2 防跳过一并烧
-  if (i < 2) set.add(step.name + "。跟着提示音走，升调吸气，降调呼气。");
+night.steps.forEach((step) => {
+  // 进入每节先念：名字 + 完整口语要领（app.js renderNightStep 用同一 step.saySetup，逐字节一致）
+  if (step.saySetup) set.add(step.saySetup);
   // 呼气间隙随机念的要点池（startBreathCoach，E1–E4 全部）
   (step.points || []).forEach((p) => set.add(p));
 });
+
+// 提示音约定：首个呼吸步念一次（app.js 同串）
+set.add("跟着提示音走：升调是吸气，降调是呼气。");
+// 转场信号词：每节念完要领后念它，再开始计时（app.js 同串）
+set.add("开始。");
 
 // 结尾句（finishNight）+ 兜底句（与 outro[0] 相同，Set 自动去重）
 (night.outro || []).forEach((s) => set.add(s));
