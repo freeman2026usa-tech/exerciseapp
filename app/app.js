@@ -19,7 +19,7 @@
     overrides: {}, // exerciseId -> 用户在 App 内改的字段（覆盖 program.js 默认值）
     night: { logs: [] }, // 夜间放松打卡（独立于力量历史，无循环/进阶）
     settings: {
-      voiceOn: true, rate: 1, weightStep: 1, voiceURI: null, autoAdvance: true, nightVoice: null,
+      voiceOn: true, rate: 1, weightStep: 1, voiceURI: null, autoAdvance: true, nightVoice: null, setCues: true,
       vol: { voice: 1, music: 0.5, tone: 0.7 }, // 语音 / 背景音乐 / 提示音 各自音量 0–1
       musicTrack: "off", // 背景音乐：off=关闭（默认）；synth=生成式轻音；或 tracks.js 里 mp3 的 name
     },
@@ -60,7 +60,8 @@
       const vs = window.speechSynthesis.getVoices() || [];
       this.zhList = vs.filter((v) => /zh|cmn|Chinese/i.test(v.lang + v.name));
       const chosen = S.settings.voiceURI && vs.find((v) => v.voiceURI === S.settings.voiceURI);
-      this.zh = chosen || this.zhList[0] || null;
+      const localZh = this.zhList.find((v) => v.localService); // 优先本地音色：断网/在线音色不可用也能出声
+      this.zh = chosen || localZh || this.zhList[0] || null;
       this.hasZh = this.zhList.length > 0;
     },
     list() { this.refresh(); return this.zhList; },
@@ -382,11 +383,23 @@
   /* ============================ 会话状态 ============================ */
   let session = null; // 力量会话
   let nightSession = null; // 夜间放松会话
-  let restTimer = null, nightTimer = null, transTimer = null, breathTimer = null, breathTimeout = null, introTimer = null;
+  let restTimer = null, nightTimer = null, transTimer = null, breathTimer = null, breathTimeout = null, introTimer = null, setCueTimer = null;
   let paused = false;
 
   function suggestedMenuId() {
     return P.meta.cycle[S.cycleIndex % P.meta.cycle.length];
+  }
+
+  // iOS/Safari：speechSynthesis 首次必须由用户手势同步启动，否则后续自动播报会静默
+  let speechUnlocked = false;
+  function unlockSpeech() {
+    if (speechUnlocked || !("speechSynthesis" in window)) return;
+    try {
+      window.speechSynthesis.resume();
+      const u = new SpeechSynthesisUtterance("​"); u.volume = 0;
+      window.speechSynthesis.speak(u);
+      speechUnlocked = true;
+    } catch (e) {}
   }
 
   function startSession(menuId, opts) {
@@ -408,6 +421,7 @@
       startedAt: new Date().toISOString(),
     };
     acquireWakeLock();
+    unlockSpeech(); // iOS 首触解锁语音
     renderWarmup();
   }
 
@@ -493,6 +507,7 @@
         <div class="settings-row">
           <label class="toggle"><input type="checkbox" id="voiceToggle" ${S.settings.voiceOn ? "checked" : ""}/><span>🔊 语音</span></label>
           <label class="toggle"><input type="checkbox" id="autoToggle" ${S.settings.autoAdvance ? "checked" : ""}/><span>⚡ 自动进行</span></label>
+          <label class="toggle"><input type="checkbox" id="setCuesToggle" ${S.settings.setCues !== false ? "checked" : ""}/><span>🗣 组中提醒</span></label>
           <label class="rate">语速 <input type="range" id="rateRange" min="0.6" max="1.4" step="0.1" value="${S.settings.rate}"/></label>
         </div>
         <div class="voice-pick">
@@ -535,6 +550,7 @@
     $("#installVoice").addEventListener("click", showVoiceInstall);
     $("#voiceToggle").addEventListener("change", (e) => { S.settings.voiceOn = e.target.checked; saveState(); if (S.settings.voiceOn) Voice.speak("语音已开启", { flush: true }); });
     $("#autoToggle").addEventListener("change", (e) => { S.settings.autoAdvance = e.target.checked; saveState(); });
+    { const sc = $("#setCuesToggle"); if (sc) sc.addEventListener("change", (e) => { S.settings.setCues = e.target.checked; saveState(); }); }
     const rr = $("#rateRange");
     if (rr) rr.addEventListener("change", (e) => { S.settings.rate = parseFloat(e.target.value); saveState(); Voice.test(); });
     const nvs = $("#nightVoiceSelect");
@@ -590,7 +606,7 @@
   /* ============================ 视图：热身 ============================ */
   function renderWarmup() {
     stopRest();
-    Voice.speak("开始热身，" + P.warmup.steps.length + " 步，做完进入菜单 " + session.menuId, { flush: true });
+    Voice.speak("开始热身，" + cn(P.warmup.steps.length) + "步，做完进入菜单 " + session.menuId, { flush: true });
     app.innerHTML = `
       <section class="screen warmup">
         <div class="crumb">菜单 ${session.menu.id} · ${session.menu.title}</div>
@@ -636,6 +652,40 @@
   }
 
   /* ============================ 视图：训练播放器 ============================ */
+  // 阿拉伯数字→汉字（只用于要念的动态串，让 TTS 读对；不改屏显）
+  function cn(n) {
+    n = Math.round(+n || 0);
+    if (n < 0) return "负" + cn(-n);
+    const d = "零一二三四五六七八九";
+    if (n < 10) return d[n];
+    if (n < 20) return "十" + (n % 10 ? d[n % 10] : "");
+    if (n < 100) return d[Math.floor(n / 10)] + "十" + (n % 10 ? d[n % 10] : "");
+    if (n < 1000) { const h = Math.floor(n / 100), r = n % 100; return d[h] + "百" + (r ? (r < 10 ? "零" + cn(r) : cn(r)) : ""); }
+    return String(n);
+  }
+  // 力量要领池：有生成内容(ex.cues)就用，否则兜底 voiceCue/topCue（空池=当前行为）
+  function exCues(ex) {
+    const c = ex.cues || {};
+    const core = (c.core && c.core.length) ? c.core.slice() : [ex.voiceCue || ex.topCue].filter(Boolean);
+    const extra = (c.extra && c.extra.length) ? c.extra.slice() : [];
+    return { core, extra, all: core.concat(extra) };
+  }
+  // 做组中途：每隔十几秒从要领池轮换念一句（设置可关；≥2 条才轮播）
+  function startSetCues(ex) {
+    if (!S.settings.voiceOn || S.settings.setCues === false) return;
+    const p = exCues(ex);
+    const seq = p.extra.length ? p.extra.concat(p.core) : p.all;
+    if (seq.length < 2) return;
+    let i = 0;
+    setCueTimer = setInterval(() => {
+      if (paused) return;
+      if (window.speechSynthesis && window.speechSynthesis.speaking) return; // 正在念就跳过，不打断
+      const cue = seq[i % seq.length]; i++;
+      Voice.speak(cue, { flush: false });
+      const el = $("#cueLive"); if (el) el.textContent = "🗣 " + cue;
+    }, 22000);
+  }
+
   function renderPlayer() {
     stopRest();
     const ex = session.exercises[session.exIndex];
@@ -644,7 +694,11 @@
     const tgt = computeTarget(ex);
 
     // 语音只报一句"练时该注意什么"（完整目标/要点看屏幕）
-    Voice.speak(`${ex.name}，第 ${setNo} 组。${ex.voiceCue || ex.topCue}`, { flush: true });
+    // 每组开头：名字 + 组数 + 安全句(固定必念) + core(轮换)
+    const _core = exCues(ex).core;
+    const openCue = _core.length ? _core[session.setIndex % _core.length] : (ex.voiceCue || ex.topCue);
+    const safePart = ex.safe ? ex.safe + "。" : "";
+    Voice.speak(`${ex.name}，第${cn(setNo)}组。${safePart}${openCue}`, { flush: true });
 
     const targetHtml = isSuperset
       ? `<div class="target-grid">
@@ -689,6 +743,7 @@
         ${targetHtml}
 
         <div class="cue-box">⚠ ${ex.topCue}</div>
+        <div class="cue-live" id="cueLive">🗣 ${openCue}</div>
 
         ${howtoHtml}
 
@@ -724,6 +779,7 @@
       nextExercise();
     });
     $("#abortBtn").addEventListener("click", () => finishSession(true));
+    startSetCues(ex);
   }
 
   /* ---------- 记录浮层 ---------- */
@@ -825,7 +881,7 @@
     const total = remain;
     const nextSetNo = session.setIndex + 2; // 下一组编号
     beep(660, 0.12);
-    say("休息 " + remain + " 秒", { flush: true });
+    say("休息" + cn(remain) + "秒", { flush: true });
 
     app.innerHTML = `
       <section class="screen rest">
@@ -859,6 +915,10 @@
     restTimer = setInterval(() => {
       if (paused) return;
       remain--;
+      if (remain === total - 3 && total >= 8) {
+        const rc = exCues(ex), pool = rc.extra.length ? rc.extra : rc.core;
+        if (rc.all.length >= 2 && pool.length) say("下一组，" + pool[(session.setIndex + 1) % pool.length], { flush: true });
+      }
       if (remain === 10) {
         beep(620, 0.12); // 十秒警告：双低音
         beep(620, 0.12, 0.18);
@@ -888,16 +948,16 @@
 
   function finishRest(ex) {
     session.setIndex++;
-    say("开始下一组，" + ex.name + "，第 " + (session.setIndex + 1) + " 组", { flush: true });
+    say("开始下一组，" + ex.name + "，第" + cn(session.setIndex + 1) + "组", { flush: true });
     renderPlayer();
   }
 
   function stopRest() {
-    [restTimer, nightTimer, transTimer, breathTimer].forEach((t) => t && clearInterval(t));
+    [restTimer, nightTimer, transTimer, breathTimer, setCueTimer].forEach((t) => t && clearInterval(t));
     if (breathTimeout) clearTimeout(breathTimeout);
     if (introTimer) clearTimeout(introTimer);
     if (currentClip) { try { currentClip.pause(); } catch (e) {} currentClip = null; }
-    restTimer = nightTimer = transTimer = breathTimer = breathTimeout = introTimer = null;
+    restTimer = nightTimer = transTimer = breathTimer = breathTimeout = introTimer = setCueTimer = null;
     paused = false;
   }
 
@@ -1270,6 +1330,7 @@
     Voice.stop();
     nightSession = { stepIndex: 0, startedAt: new Date().toISOString(), skipped: {}, remain: 0, started: false };
     acquireWakeLock();
+    unlockSpeech();
     Music.start(S.settings.musicTrack);
     renderNightIntro();
   }
