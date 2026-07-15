@@ -499,12 +499,24 @@
           <label>音乐</label>
           <select id="musicSelect">${musicOptionsHtml()}</select>
         </div>
+        ${(window.AUDIO_MANIFEST_VOICES && window.AUDIO_MANIFEST_VOICES.length) ? `
+        <div class="voice-pick">
+          <label>🌙 夜间语音</label>
+          <select id="nightVoiceSelect">${nightVoiceOptionsHtml()}</select>
+        </div>` : ""}
         <div class="vol-grid">
           <label>语音 <input type="range" id="volVoice" min="0" max="1" step="0.05" value="${S.settings.vol.voice}"/></label>
           <label>音乐 <input type="range" id="volMusic" min="0" max="1" step="0.05" value="${S.settings.vol.music}"/></label>
           <label>提示音 <input type="range" id="volTone" min="0" max="1" step="0.05" value="${S.settings.vol.tone}"/></label>
         </div>
       </div>`;
+  }
+  function nightVoiceOptionsHtml() {
+    const list = window.AUDIO_MANIFEST_VOICES || [];
+    const cur = S.settings.nightVoice || window.AUDIO_MANIFEST_DEFAULT;
+    return list
+      .map((v) => `<option value="${escapeAttr(v.key)}" ${cur === v.key ? "selected" : ""}>${escapeHtml(v.name)}</option>`)
+      .join("");
   }
   function musicOptionsHtml() {
     const cur = S.settings.musicTrack;
@@ -525,6 +537,14 @@
     $("#autoToggle").addEventListener("change", (e) => { S.settings.autoAdvance = e.target.checked; saveState(); });
     const rr = $("#rateRange");
     if (rr) rr.addEventListener("change", (e) => { S.settings.rate = parseFloat(e.target.value); saveState(); Voice.test(); });
+    const nvs = $("#nightVoiceSelect");
+    if (nvs) nvs.addEventListener("change", (e) => {
+      S.settings.nightVoice = e.target.value; applyNightVoice(); saveState();
+      try {
+        const m = window.AUDIO_MANIFEST, p = m && m["闭上眼，让床把你接住。"];
+        if (p) { const a = new Audio(p); a.volume = (S.settings.vol && S.settings.vol.voice != null) ? S.settings.vol.voice : 1; a.play().catch(() => {}); }
+      } catch (_) {}
+    });
     const ms = $("#musicSelect");
     if (ms) ms.addEventListener("change", (e) => {
       S.settings.musicTrack = e.target.value; saveState();
@@ -1298,7 +1318,7 @@
         <div class="btn-row">
           <button class="btn ghost" id="nightPause">⏸ 暂停</button>
           <button class="btn ghost" id="nightAdd">+30s</button>
-          <button class="btn ghost" id="nightSkip">${step.skippable ? "膝不适 · 跳过" : "跳过这步"}</button>
+          <button class="btn ghost" id="nightSkip">跳过这步</button>
         </div>
         <button class="link night-how" id="nightHow">做法（睁眼看）</button>
       </section>`;
@@ -1331,7 +1351,7 @@
       if (!alive()) return;
       if (isBreath && !nightSession.guided) {
         nightSession.guided = true;
-        sayThen("跟着提示音走，升调是吸气，降调是呼气。", afterGuide, { flush: true });
+        sayThen("跟着提示音走：升调是吸气，降调是呼气。", afterGuide, { flush: true });
       } else {
         afterGuide();
       }

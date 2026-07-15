@@ -38,9 +38,16 @@ MANIFEST = os.path.join(ROOT, "app", "audio", "manifest.js")
 STRINGS = os.path.join(HERE, "night_strings.json")
 
 DEFAULT_VOICE = "seren"
+BURN = {"seren"}  # 本轮只合成这些音色；其余音色沿用现有 manifest 里的旧映射（切过去改动句回退 TTS）
 # key, 显示名, engine(qwen|vd), qwen 用的 voice 名（vd 忽略，改读 custom_voice_id_<key>.txt）
 VOICES = [
-    ("seren", "Seren", "qwen", "Seren"),  # 定稿只用 Seren；要多把再往下加即可
+    ("seren",    "Seren",    "qwen", "Seren"),
+    ("katerina", "卡捷琳娜", "qwen", "Katerina"),
+    ("jingshu",  "静姝",     "vd",   None),
+    ("ruanmian", "软眠",     "vd",   None),
+    ("nuanyi",   "暖依",     "vd",   None),
+    ("hexu",     "和煦",     "vd",   None),
+    ("qingyu",   "轻语",     "vd",   None),
 ]
 
 if not os.path.exists(STRINGS):
@@ -134,28 +141,45 @@ def burn_voice(key, name, engine, qvoice):
     return m, fails
 
 
+def load_base_by_voice():
+    # 读现有 manifest.js 里的 AUDIO_MANIFEST_BY_VOICE（保留本轮不烧的音色映射）
+    if not os.path.exists(MANIFEST):
+        return {}
+    txt = open(MANIFEST, encoding="utf-8").read()
+    marker = "window.AUDIO_MANIFEST_BY_VOICE = "
+    if marker not in txt:
+        return {}
+    start = txt.index(marker) + len(marker)
+    try:
+        end = txt.index(";\nwindow.AUDIO_MANIFEST_VOICES", start)
+        return json.loads(txt[start:end])
+    except Exception:
+        return {}
+
+
 def main():
     os.makedirs(CLIPS, exist_ok=True)
-    print("待烧 %d 条 × %d 把音色 = %d 次（已存在的跳过）" % (
-        len(TEXTS), len(VOICES), len(TEXTS) * len(VOICES)))
+    base = load_base_by_voice()
+    print("待烧 %d 条 · 本轮合成音色: %s（其余沿用现有映射）" % (len(TEXTS), ", ".join(sorted(BURN))))
     by_voice = {}
     voices_meta = []
-    incomplete = []
     for key, name, engine, qvoice in VOICES:
-        m, fails = burn_voice(key, name, engine, qvoice)
-        by_voice[key] = m
-        if len(m) == len(TEXTS):
-            voices_meta.append({"key": key, "name": name})
+        if key in BURN:
+            m, fails = burn_voice(key, name, engine, qvoice)
+            if fails:
+                print("!! %s(%s) 有 %d 条失败，未写 manifest（修好再跑）" % (name, key, len(fails)))
+                return 2
         else:
-            incomplete.append(name)
+            m = base.get(key, {})
+            print(">> %-9s(%s) 沿用现有映射 %d 条（未重烧）" % (name, key, len(m)))
+        by_voice[key] = m
+        if m:
+            voices_meta.append({"key": key, "name": name})
 
     if DEFAULT_VOICE not in [v["key"] for v in voices_meta]:
-        print("!! 默认音色 %s 未烧全，暂不写 manifest（补齐后重跑）" % DEFAULT_VOICE)
+        print("!! 默认音色 %s 无映射，停止" % DEFAULT_VOICE)
         return 2
-    if incomplete:
-        print("!! 未烧全（本次不列入选择器）：" + "、".join(incomplete) + " —— 重跑可补齐")
 
-    # 只写「已烧全」的音色，避免选择器里出现放不出声的死音色
     good = {v["key"]: by_voice[v["key"]] for v in voices_meta}
     header = (
         "/*\n"
