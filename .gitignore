@@ -2,5 +2,7 @@ Thumbs.db
 desktop.ini
 .DS_Store
 scripts/custom_voice_id*.txt
+# DashScope API key（本地烧录用，绝不入仓）
+scripts/.dashscope_key
 # 音色试听临时件（本地挑音色用，不入公开仓）
 app/audio/samples/
