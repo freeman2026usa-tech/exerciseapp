@@ -278,12 +278,19 @@
     },
   };
 
+  // clip 查找：夜间音色池优先，未命中查力量池（力量与夜间共用出声缝，文本天然不撞车）。
+  function clipFor(text) {
+    const m = window.AUDIO_MANIFEST; // 夜间：当前音色 { 文本: 路径 }
+    if (m && m[text]) return m[text];
+    const s = window.AUDIO_MANIFEST_STRENGTH; // 力量：单音色 { 文本: 路径 }
+    return (s && s[text]) || null;
+  }
   // 渲染层唯一出声入口（接口缝）：预渲染 clip → 运行时大模型适配器 → 浏览器 TTS 兜底。
   // 以后"换大模型渲染音频"只动这里 + 跑生成脚本；内容/编排/UI 全不改。
   function say(text, opts) {
     if (!S.settings.voiceOn || !text) return;
-    const manifest = window.AUDIO_MANIFEST; // Phase 2：{ 文本: "audio/xxx.mp3" }
-    if (manifest && manifest[text]) return playClip(manifest[text], opts, text);
+    const src = clipFor(text);
+    if (src) return playClip(src, opts, text);
     if (typeof window.AI_TTS === "function") return window.AI_TTS(text, opts); // 可插拔运行时（默认无）
     Voice.speak(text, opts); // 兜底
   }
@@ -308,12 +315,21 @@
   function sayThen(text, done, opts) {
     const cb = typeof done === "function" ? done : function () {};
     if (!S.settings.voiceOn || !text) { setTimeout(cb, 120); return; }
-    const manifest = window.AUDIO_MANIFEST;
-    if (manifest && manifest[text]) return playClip(manifest[text], opts, text, cb);
+    const src = clipFor(text);
+    if (src) return playClip(src, opts, text, cb);
     if (typeof window.AI_TTS === "function") window.AI_TTS(text, opts);
     else Voice.speak(text, opts);
     setTimeout(cb, Math.min(9000, 900 + text.length * 170));
   }
+  // 力量语音解析器：把 §三 引擎选出的 id 解析成文本，交给共用 sayThen（不是第二套系统）。
+  function sayCue(id, done, opts) {
+    const cb = typeof done === "function" ? done : function () {};
+    const v = (window.STRENGTH_VOICE || {})[id];
+    if (v && v.text) return sayThen(v.text, cb, opts || { flush: true });
+    if (id) console.warn("strength: 未知 id", id);
+    setTimeout(cb, 120);
+  }
+  function sayCueNow(id, opts) { const v = (window.STRENGTH_VOICE || {})[id]; if (v && v.text) say(v.text, opts || { flush: true }); } // fire-and-forget
 
   // 多音色可切换：按设置里选定的「夜间语音」，切换 say() 命中的 clip 集（不影响力量训练的 TTS）
   function applyNightVoice() {
@@ -383,7 +399,7 @@
   /* ============================ 会话状态 ============================ */
   let session = null; // 力量会话
   let nightSession = null; // 夜间放松会话
-  let restTimer = null, nightTimer = null, transTimer = null, breathTimer = null, breathTimeout = null, introTimer = null, setCueTimer = null;
+  let restTimer = null, nightTimer = null, transTimer = null, breathTimer = null, breathTimeout = null, introTimer = null, setCueTimer = null, chainTimer = null;
   let paused = false;
 
   function suggestedMenuId() {
@@ -411,12 +427,19 @@
       const idx = [...exercises].reverse().findIndex((e) => e.optional);
       if (idx !== -1) exercises.splice(exercises.length - 1 - idx, 1);
     }
+    const slots = window.STRENGTH_VOICE_SLOTS || { menuNames: {} };
     session = {
       menuId,
       menu,
       exercises,
       exIndex: 0,
       setIndex: 0,
+      segIndex: 0,
+      used: new Set(),
+      ledFor: -1, // 已念过 LEAD 的 exIndex（防每组重念）
+      playTok: 0, // 出声令牌：重渲即自增，作废在途异步链
+      w6: Math.random() < 0.5 ? "W6a" : "W6b", // 热身臀圈二选一
+      menuShort: slots.menuNames[menuId] || menuId, // G_OPEN 槽位短名
       logs: {}, // exId -> [{reps,weight,rir,pain}]
       startedAt: new Date().toISOString(),
     };
@@ -603,51 +626,83 @@
     app.querySelectorAll(".menu-btn").forEach((b) => b.addEventListener("click", () => startSession(b.dataset.menu)));
   }
 
-  /* ============================ 视图：热身 ============================ */
+  /* ============================ 视图：热身（逐个引导）============================ */
+  // 该步的语音 prefix：W7 按当天菜单、W6 二选一、其余用 id
+  function warmLead(step) {
+    if (step.byMenu) return step.byMenu[session.menuId] + "_LEAD";
+    if (step.pick) return session.w6 + "_LEAD";
+    return step.id + "_LEAD";
+  }
+  function warmCuePrefix(step) {
+    if (step.byMenu) return "W7"; // 组中提示是共用的 W7.*（LEAD 才分菜单）
+    if (step.pick) return session.w6;
+    return step.id;
+  }
   function renderWarmup() {
     stopRest();
-    Voice.speak("开始热身，" + cn(P.warmup.steps.length) + "步，做完进入菜单 " + session.menuId, { flush: true });
+    sayCueNow("G_OPEN_0" + (1 + Math.floor(Math.random() * 6)) + "__" + session.menuShort); // 今天X，先热身
+    renderWarmupStep(0);
+  }
+  function renderWarmupStep(i) {
+    stopRest();
+    const steps = P.warmup.steps;
+    if (i >= steps.length) { sayCueNow(pickRand("G_MAIN", 4)); enterPlayer(); return; } // 热身完 → 进正课
+    session.warmIndex = i;
+    session.warmSeg = 0;
+    const step = steps[i];
+    const single = step.side === "single";
     app.innerHTML = `
       <section class="screen warmup">
-        <div class="crumb">菜单 ${session.menu.id} · ${session.menu.title}</div>
-        <h2>热身（必做）</h2>
+        <div class="crumb">菜单 ${session.menu.id} · ${session.menu.title} · 热身</div>
+        <div class="ex-id">${step.id}</div>
+        <div class="set-counter">热身 <b>${i + 1}</b> / ${steps.length}${single ? " · 两侧都做" : ""}</div>
+        <h1 class="ex-name">${step.name}</h1>
+        <div class="target-grid"><div class="tg"><span>次数</span><b>${step.amount}</b></div></div>
+        <div class="cue-live" id="cueLive"></div>
+        <div class="howto"><div class="howto-title">要点</div><p class="ci-purpose">${step.purpose}</p></div>
         <p class="hint">${P.warmup.note}</p>
-        <ul class="check-list">
-          ${P.warmup.steps
-            .map(
-              (s, i) => `
-            <li class="check-item" data-i="${i}">
-              <span class="ck"></span>
-              <div>
-                <div class="ci-name">${s.name} <em>${s.amount}</em></div>
-                <div class="ci-purpose">${s.purpose}</div>
-              </div>
-            </li>`
-            )
-            .join("")}
-        </ul>
-        <div class="btn-row">
-          <button class="btn ghost" id="skipWarm">跳过热身</button>
-          <button class="btn primary" id="doneWarm">进入正式训练 ▶</button>
+        <div class="done-row">
+          <button class="btn primary huge" id="warmNext">这组完成 ▶</button>
+        </div>
+        <div class="more-row">
+          <button class="btn ghost sm" id="skipWarm">跳过热身</button>
         </div>
       </section>`;
 
-    app.querySelectorAll(".check-item").forEach((li) =>
-      li.addEventListener("click", () => {
-        li.classList.toggle("done");
-        if (li.classList.contains("done")) {
-          const s = P.warmup.steps[+li.dataset.i];
-          Voice.speak(s.name, { flush: true });
-        }
-      })
-    );
+    const prefix = warmCuePrefix(step);
+    const enterWarmSeg = (seg) => {
+      session.warmSeg = seg;
+      const g = () => !!(session && session.warmIndex === i && session.warmSeg === seg);
+      const b = $("#warmNext"); if (b) b.textContent = (single && seg === 0) ? "换边 →" : "这组完成 ▶";
+      const enterIds = single ? [prefix + ".side." + (seg === 0 ? "start" : "switch") + ".S"] : [];
+      chainIds(enterIds, () => {
+        if (!g()) return;
+        setCueTimer = setTimeout(() => { // 10s 后补一条 .S（热身唤醒，非力竭）
+          setCueTimer = null;
+          if (!g()) return;
+          const it = pickCue(prefix, { types: ["setup", "feel", "avoid"], variant: "S", rotate: seg, exclude: new Set() });
+          if (it) { sayCueNow(it + ".S"); setCueLive(it + ".S"); }
+        }, 10000);
+      }, g);
+    };
+
+    const g0 = () => !!(session && session.warmIndex === i);
+    sayCue(warmLead(step), () => { if (g0()) enterWarmSeg(0); }, { flush: true });
+
+    $("#warmNext").addEventListener("click", () => {
+      if (setCueTimer) { clearTimeout(setCueTimer); setCueTimer = null; }
+      if (chainTimer) { clearTimeout(chainTimer); chainTimer = null; }
+      if (single && session.warmSeg === 0) enterWarmSeg(1);
+      else renderWarmupStep(i + 1);
+    });
     $("#skipWarm").addEventListener("click", enterPlayer);
-    $("#doneWarm").addEventListener("click", enterPlayer);
   }
 
   function enterPlayer() {
+    stopRest();
     session.exIndex = 0;
     session.setIndex = 0;
+    session.ledFor = -1;
     renderPlayer();
   }
 
@@ -663,42 +718,121 @@
     if (n < 1000) { const h = Math.floor(n / 100), r = n % 100; return d[h] + "百" + (r ? (r < 10 ? "零" + cn(r) : cn(r)) : ""); }
     return String(n);
   }
-  // 力量要领池：有生成内容(ex.cues)就用，否则兜底 voiceCue/topCue（空池=当前行为）
-  function exCues(ex) {
-    const c = ex.cues || {};
-    const core = (c.core && c.core.length) ? c.core.slice() : [ex.voiceCue || ex.topCue].filter(Boolean);
-    const extra = (c.extra && c.extra.length) ? c.extra.slice() : [];
-    return { core, extra, all: core.concat(extra) };
+  /* ===== 力量语音引擎（§三播放引擎，按 id 选句 → sayCue → 共用 say/sayThen 文本键出声）===== */
+  // 陈旧守卫：快照 exIndex/setIndex/segIndex/playTok，在途异步回调复检（在途 setTimeout/clip 回调不可取消）
+  function guardFor() {
+    if (!session) return () => false;
+    const tok = session.playTok, ex = session.exIndex, st = session.setIndex, sg = session.segIndex;
+    return () => !!(session && session.playTok === tok && session.exIndex === ex && session.setIndex === st && session.segIndex === sg);
   }
-  // 做组中途：每隔十几秒从要领池轮换念一句（设置可关；≥2 条才轮播）
-  function startSetCues(ex) {
-    if (!S.settings.voiceOn || S.settings.setCues === false) return;
-    const p = exCues(ex);
-    const seq = p.extra.length ? p.extra.concat(p.core) : p.all;
-    if (seq.length < 2) return;
+  function silence(ms, cb) { chainTimer = setTimeout(() => { chainTimer = null; cb(); }, ms); }
+  // 顺序念一串 id（side.start/super.in 等）；每条放完再下一条；g 失效即止
+  function chainIds(ids, done, g) {
     let i = 0;
-    setCueTimer = setInterval(() => {
-      if (paused) return;
-      if (window.speechSynthesis && window.speechSynthesis.speaking) return; // 正在念就跳过，不打断
-      const cue = seq[i % seq.length]; i++;
-      Voice.speak(cue, { flush: false });
-      const el = $("#cueLive"); if (el) el.textContent = "🗣 " + cue;
-    }, 22000);
+    const step = () => {
+      if (g && !g()) return;
+      if (i >= ids.length) return done();
+      sayCue(ids[i++], step, { flush: true });
+    };
+    step();
+  }
+  function pickRand(prefix, n) { return prefix + "_0" + (1 + Math.floor(Math.random() * n)); }
+  function setCueLive(id) { const el = $("#cueLive"); if (el) el.textContent = "🗣 " + (((window.STRENGTH_VOICE || {})[id] || {}).text || ""); }
+  function restBucket(sec) {
+    const b = ((window.STRENGTH_VOICE_SLOTS || {}).restBuckets) || [45, 60, 75, 90, 120];
+    if (b.indexOf(sec) >= 0) return sec;
+    return b.reduce((best, x) => (Math.abs(x - sec) < Math.abs(best - sec) ? x : best), b[0]);
+  }
+  // 子动作列表（普通=自身；超级组=voiceSubs；单侧标 side）
+  function voiceSubsFor(ex) {
+    if (ex.voiceSubs && ex.voiceSubs.length) return ex.voiceSubs;
+    return [{ id: ex.id, side: ex.perSide ? "single" : "double" }];
+  }
+  // 一组内 segment 序列：super.in（换子动作）与 side.start/switch（换侧）统一成「组内推进」
+  function segmentsFor(ex) {
+    const subs = voiceSubsFor(ex);
+    const segs = [];
+    subs.forEach((sub, j) => {
+      const transIn = j > 0 ? ex.id + ".super.in." + j : null;
+      if (sub.side === "single") {
+        segs.push({ sub: sub.id, subOrder: j, enter: [transIn, sub.id + ".side.start.S"].filter(Boolean), sideOff: 0 });
+        segs.push({ sub: sub.id, subOrder: j, enter: [sub.id + ".side.switch.S"], sideOff: 1 });
+      } else {
+        segs.push({ sub: sub.id, subOrder: j, enter: [transIn].filter(Boolean), sideOff: 0 });
+      }
+    });
+    return segs;
+  }
+  function segLabel(ex, segs, k) {
+    if (k >= segs.length - 1) return "✔ 完成（按计划）";
+    const next = segs[k + 1];
+    if (next.sideOff === 1) return "换边 →";
+    if (ex.superset && ex.superset[next.subOrder]) return "→ 接" + ex.superset[next.subOrder].name;
+    return "→ 下一个";
+  }
+  // 收集某子动作、指定类型集、指定变体(S|L)的内容项 id（sub.type.NN，去 S/L 变体），按类型优先级+序号排序
+  function collectItems(sub, types, variant) {
+    const V = window.STRENGTH_VOICE || {};
+    const order = { feel: 0, setup: 1, avoid: 2, watch: 3, breath: 4, regress: 5, progress: 6 };
+    const seen = new Set(), items = [];
+    for (const id in V) {
+      const m = id.match(/^(.+)\.([a-z]+)\.(\d+)\.(S|L)$/);
+      if (!m || m[1] !== sub || m[4] !== variant || types.indexOf(m[2]) < 0) continue;
+      const item = m[1] + "." + m[2] + "." + m[3];
+      if (seen.has(item)) continue;
+      seen.add(item);
+      items.push({ item, type: m[2], nn: parseInt(m[3], 10) });
+    }
+    items.sort((a, b) => (order[a.type] - order[b.type]) || (a.nn - b.nn));
+    return items.map((x) => x.item);
+  }
+  // 从池中按 rotate 轮换选一条内容项，排除已用；返回内容项 id（不含变体）或 null
+  function pickCue(sub, opts) {
+    const pool = collectItems(sub, opts.types, opts.variant).filter((it) => !(opts.exclude && opts.exclude.has(it)));
+    if (!pool.length) return null;
+    const r = ((opts.rotate % pool.length) + pool.length) % pool.length;
+    return pool[r];
+  }
+  // 开始一组：重置已用、末组先念「最后一组」、进第一个 segment
+  function beginSet(ex) {
+    session.used = new Set();
+    session.segIndex = 0;
+    const g = guardFor();
+    if (session.setIndex === ex.sets - 1) sayCue(pickRand("G_LAST", 4), () => { if (g()) enterSegment(ex, 0); }, { flush: true });
+    else enterSegment(ex, 0);
+  }
+  // 进第 k 个 segment：念 super.in/side.start|switch → 0.5s → 组中提示
+  function enterSegment(ex, k) {
+    session.segIndex = k;
+    const segs = segmentsFor(ex);
+    const seg = segs[k];
+    const b = $("#doneSet"); if (b) b.textContent = segLabel(ex, segs, k);
+    const g = guardFor();
+    chainIds(seg.enter, () => { if (g()) silence(500, () => { if (g()) scheduleMidSet(ex, seg); }); }, g);
+  }
+  // 组中：一条 S 提示（feel/setup/avoid 轮换、排除已用）→ 12–15s → 安全句（每组必念）→ 静默到点击
+  function scheduleMidSet(ex, seg) {
+    const g = guardFor();
+    if (S.settings.setCues !== false) {
+      const item = pickCue(seg.sub, { types: ["feel", "setup", "avoid"], variant: "S", rotate: session.setIndex + seg.sideOff, exclude: session.used });
+      if (item) { session.used.add(item); sayCueNow(item + ".S"); setCueLive(item + ".S"); }
+    }
+    setCueTimer = setTimeout(() => {
+      setCueTimer = null;
+      if (!g()) return;
+      sayCueNow(seg.sub + ".watch.01.L"); // 安全句：每组必念、不轮换、不去重
+      setCueLive(seg.sub + ".watch.01.L");
+    }, 12000 + Math.floor(Math.random() * 3000));
   }
 
   function renderPlayer() {
     stopRest();
+    session.playTok = (session.playTok || 0) + 1;
+    session.segIndex = 0;
     const ex = session.exercises[session.exIndex];
     const setNo = session.setIndex + 1;
     const isSuperset = ex.type === "superset";
     const tgt = computeTarget(ex);
-
-    // 语音只报一句"练时该注意什么"（完整目标/要点看屏幕）
-    // 每组开头：名字 + 组数 + 安全句(固定必念) + core(轮换)
-    const _core = exCues(ex).core;
-    const openCue = _core.length ? _core[session.setIndex % _core.length] : (ex.voiceCue || ex.topCue);
-    const safePart = ex.safe ? ex.safe + "。" : "";
-    Voice.speak(`${ex.name}，第${cn(setNo)}组。${safePart}${openCue}`, { flush: true });
 
     const targetHtml = isSuperset
       ? `<div class="target-grid">
@@ -743,7 +877,7 @@
         ${targetHtml}
 
         <div class="cue-box">⚠ ${ex.topCue}</div>
-        <div class="cue-live" id="cueLive">🗣 ${openCue}</div>
+        <div class="cue-live" id="cueLive"></div>
 
         ${howtoHtml}
 
@@ -763,7 +897,17 @@
         </div>
       </section>`;
 
-    $("#doneSet").addEventListener("click", () => quickLogSet(ex));
+    $("#doneSet").addEventListener("click", () => {
+      const segs = segmentsFor(ex);
+      if (session.segIndex < segs.length - 1) {
+        // 单侧换边 / 超级组换子动作：只推进 segment，不记录不休息
+        if (setCueTimer) { clearTimeout(setCueTimer); setCueTimer = null; }
+        if (chainTimer) { clearTimeout(chainTimer); chainTimer = null; }
+        enterSegment(ex, session.segIndex + 1);
+      } else {
+        quickLogSet(ex);
+      }
+    });
     $("#adjustSet").addEventListener("click", () => openRecord(ex));
     $("#detailBtn").addEventListener("click", () => showDetail(ex));
     $("#harderBtn").addEventListener("click", () => {
@@ -779,7 +923,17 @@
       nextExercise();
     });
     $("#abortBtn").addEventListener("click", () => finishSession(true));
-    startSetCues(ex);
+
+    // 编排：动作首组念 LEAD→静默2.5s→G_GO→组；后续组只念 G_GO（休息归零时=决策②，G_GO 唯一归 renderPlayer）
+    const g = guardFor();
+    if (session.setIndex === 0 && session.ledFor !== session.exIndex) {
+      session.ledFor = session.exIndex;
+      sayCue(ex.id + "_LEAD", () => { if (!g()) return; silence(2500, () => { if (g()) sayCue("G_GO", () => { if (g()) beginSet(ex); }); }); }, { flush: true });
+    } else if (session.setIndex === 0) {
+      beginSet(ex); // set0 因编辑重渲：不重念 LEAD
+    } else {
+      sayCue("G_GO", () => { if (g()) beginSet(ex); }, { flush: true });
+    }
   }
 
   /* ---------- 记录浮层 ---------- */
@@ -851,12 +1005,13 @@
 
     if (pain) Voice.speak("记下不适。若关节刺痛或异响伴痛，请停下换动作。", { flush: true });
 
-    // 还有下一组？→ 休息；否则下一个动作
-    if (session.setIndex < ex.sets - 1) {
-      startRest(ex);
-    } else {
-      nextExercise();
-    }
+    advanceAfterSet(ex);
+  }
+
+  // 一组记完：非末组→休息（休息里念 G_SETEND→G_REST）；末组→念动作记录句 {id}_END 再进下一个动作
+  function advanceAfterSet(ex) {
+    if (session.setIndex < ex.sets - 1) startRest(ex);
+    else { sayCueNow(ex.id + "_END"); nextExercise(); }
   }
 
   // 一键按计划完成本组：直接用进阶引擎的目标值记录，不弹浮层
@@ -871,8 +1026,7 @@
     }
     if (!session.logs[ex.id]) session.logs[ex.id] = [];
     session.logs[ex.id][session.setIndex] = rec;
-    if (session.setIndex < ex.sets - 1) startRest(ex);
-    else nextExercise();
+    advanceAfterSet(ex);
   }
 
   /* ============================ 视图：组间休息 ============================ */
@@ -881,7 +1035,8 @@
     const total = remain;
     const nextSetNo = session.setIndex + 2; // 下一组编号
     beep(660, 0.12);
-    say("休息" + cn(remain) + "秒", { flush: true });
+    // 这组完成 → 歇N秒，手臂甩松（顺序，别互相打断）
+    sayCue(pickRand("G_SETEND", 5), () => sayCueNow("G_REST__" + restBucket(ex.restSec || 60)), { flush: true });
 
     app.innerHTML = `
       <section class="screen rest">
@@ -915,15 +1070,19 @@
     restTimer = setInterval(() => {
       if (paused) return;
       remain--;
-      if (remain === total - 3 && total >= 8) {
-        const rc = exCues(ex), pool = rc.extra.length ? rc.extra : rc.core;
-        if (rc.all.length >= 2 && pool.length) say("下一组，" + pool[(session.setIndex + 1) % pool.length], { flush: true });
+      // 歇的第 15 秒：下一组盯 + 一条 L（轮换、排除本组已用）
+      if (remain === total - 15 && total >= 35) {
+        const g = guardFor();
+        const restSub = ex.type === "superset" ? segmentsFor(ex)[0].sub : ex.id;
+        sayCue("G_FOCUS", () => {
+          if (!g()) return;
+          const item = pickCue(restSub, { types: ["setup", "avoid", "watch", "breath", "regress"], variant: "L", rotate: session.setIndex, exclude: session.used });
+          if (item) { session.used.add(item); sayCueNow(item + ".L"); }
+        }, { flush: true });
       }
-      if (remain === 10) {
-        beep(620, 0.12); // 十秒警告：双低音
-        beep(620, 0.12, 0.18);
-        say("还有十秒", { flush: true });
-      }
+      // 剩 15 秒：预警（G_GO 归 renderPlayer，在归零后念）
+      if (remain === 15 && total > 20) sayCueNow(pickRand("G_TIMER", 4));
+      if (remain === 10) { beep(620, 0.12); beep(620, 0.12, 0.18); } // 十秒警告：双低音
       if (remain <= 3 && remain > 0) beep(700, 0.08);
       if (remain <= 0) {
         stopRest();
@@ -948,16 +1107,17 @@
 
   function finishRest(ex) {
     session.setIndex++;
-    say("开始下一组，" + ex.name + "，第" + cn(session.setIndex + 1) + "组", { flush: true });
-    renderPlayer();
+    renderPlayer(); // G_GO 在 renderPlayer set>0 分支念（此刻=休息归零，决策②）
   }
 
   function stopRest() {
     [restTimer, nightTimer, transTimer, breathTimer, setCueTimer].forEach((t) => t && clearInterval(t));
     if (breathTimeout) clearTimeout(breathTimeout);
     if (introTimer) clearTimeout(introTimer);
+    if (setCueTimer) clearTimeout(setCueTimer);
+    if (chainTimer) clearTimeout(chainTimer);
     if (currentClip) { try { currentClip.pause(); } catch (e) {} currentClip = null; }
-    restTimer = nightTimer = transTimer = breathTimer = breathTimeout = introTimer = setCueTimer = null;
+    restTimer = nightTimer = transTimer = breathTimer = breathTimeout = introTimer = setCueTimer = chainTimer = null;
     paused = false;
   }
 
@@ -980,7 +1140,7 @@
       return;
     }
     const ex = session.exercises[session.exIndex];
-    Voice.speak("下一个，" + ex.name, { flush: true });
+    // 不再念「下一个」：过渡后 renderPlayer 会念该动作 LEAD（「下一节，…」），避免与上一动作 {id}_END 抢麦
     if (!S.settings.autoAdvance) {
       modal(
         `<h3>完成上一个动作 ✔</h3>
@@ -1032,7 +1192,8 @@
     const doneExs = Object.keys(session.logs);
     let setCount = 0;
     doneExs.forEach((id) => (setCount += session.logs[id].filter(Boolean).length));
-    Voice.speak(aborted ? "训练结束。" : "全部完成，做得好！", { flush: true });
+    if (aborted) Voice.speak("训练结束。", { flush: true });
+    else sayCueNow(pickRand("G_FIN", 5)); // 今天练完了，拉伸放松，填训练日志
 
     const rows = session.exercises
       .map((ex) => {

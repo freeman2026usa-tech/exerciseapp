@@ -61,14 +61,15 @@ window.PROGRAM = {
   // ---- 热身（每次开练前必做） ----
   warmup: {
     note: "晨练体温低，各做慢一点、多做一组。热身不追求力竭，只是唤醒和润滑。",
+    // id/side/pick/byMenu 供力量语音引擎逐个引导用：单侧步换边多点一下；W6 二选一、W7 按当天菜单选
     steps: [
-      { name: "360°呼吸", amount: "8 次", purpose: "唤醒核心、收肋骨（呼气时肋骨下沉贴地、收紧核心）" },
-      { name: "猫牛", amount: "8 次", purpose: "活动脊柱（吸气塌腰抬头，呼气拱背低头，缓慢交替）" },
-      { name: "收下巴 chin tuck", amount: "10 次", purpose: "治探头（下巴水平后收，不是低头）" },
-      { name: "弹力带撕裂", amount: "15 次", purpose: "激活肩后束、减肩弹响（保持手臂伸直，肩胛后收下沉）" },
-      { name: "泡沫轴放松髂腰肌（未购前：弓步髋屈肌拉伸）", amount: "每侧 30 秒", purpose: "松髋屈肌，治腰紧/弹响髋（垫大腿根前侧靠内，避开正中骨头。无泡沫轴则半跪弓步：后膝跪软垫、同侧手举高、骨盆后倾、重心前移，大腿根前侧有拉伸感即可）" },
-      { name: "臀圈激活：蚌式 或 侧向走", amount: "蚌式每侧 15 / 侧向每向 10 步", purpose: "唤醒臀肌（骨盆别后倒，膝盖别内扣）" },
-      { name: "目标肌群动态活动", amount: "各 10", purpose: "推/肩日：绕肩各10+空俯卧撑10；拉日：悬垂20秒+直臂下拉空动作10；腿日：徒手半蹲10+臀桥10" },
+      { id: "W1", name: "360°呼吸", amount: "8 次", purpose: "唤醒核心、收肋骨（呼气时肋骨下沉贴地、收紧核心）" },
+      { id: "W2", name: "猫牛", amount: "8 次", purpose: "活动脊柱（吸气塌腰抬头，呼气拱背低头，缓慢交替）" },
+      { id: "W3", name: "收下巴 chin tuck", amount: "10 次", purpose: "治探头（下巴水平后收，不是低头）" },
+      { id: "W4", name: "弹力带撕裂", amount: "15 次", purpose: "激活肩后束、减肩弹响（保持手臂伸直，肩胛后收下沉）" },
+      { id: "W5", side: "single", name: "泡沫轴放松髂腰肌（未购前：弓步髋屈肌拉伸）", amount: "每侧 30 秒", purpose: "松髋屈肌，治腰紧/弹响髋（垫大腿根前侧靠内，避开正中骨头。无泡沫轴则半跪弓步：后膝跪软垫、同侧手举高、骨盆后倾、重心前移，大腿根前侧有拉伸感即可）" },
+      { id: "W6", pick: ["W6a", "W6b"], side: "single", name: "臀圈激活：蚌式 或 侧向走", amount: "蚌式每侧 15 / 侧向每向 10 步", purpose: "唤醒臀肌（骨盆别后倒，膝盖别内扣）" },
+      { id: "W7", byMenu: { A: "W7_PUSHSHLD", B: "W7_PULL", C: "W7_PUSHSHLD", D: "W7_LEG" }, name: "目标肌群动态活动", amount: "各 10", purpose: "推/肩日：绕肩各10+空俯卧撑10；拉日：悬垂20秒+直臂下拉空动作10；腿日：徒手半蹲10+臀桥10" },
     ],
   },
 
@@ -372,6 +373,7 @@ window.PROGRAM = {
           id: "C4", name: "面拉 + 死虫（超级组）", type: "superset", weighted: false,
           target: "肩后束/上背/旋转肌 + 核心抗伸展", equipment: "弹力带固定高处 + 瑜伽垫",
           sets: 3, restSec: 45,
+          voiceSubs: [{ id: "C4a", side: "double" }, { id: "DV", side: "double" }],
           supersetLabel: "面拉 20 次 → 接 死虫 10 次 为一组",
           superset: [
             { name: "面拉（弹力带）", reps: "20", how: "带子固定略高于头，双手拉向面部/额头，同时肘向外上方展开、肩胛后收，挤肩后束 1 秒慢放。" },
@@ -483,6 +485,7 @@ window.PROGRAM = {
           id: "D4", name: "死虫 + 侧平板（核心超级组）", type: "superset", weighted: false,
           target: "核心抗伸展 + 抗侧屈、臀中肌", equipment: "瑜伽垫",
           sets: 3, restSec: 45,
+          voiceSubs: [{ id: "DV", side: "double" }, { id: "D4b", side: "single" }],
           supersetLabel: "死虫 10 次 → 接 侧平板每侧 20–30 秒 为一组",
           superset: [
             { name: "死虫", reps: "左右各 5 = 10", how: "仰卧手指天、髋膝屈 90°，下背贴地，缓慢伸对侧手脚接近地面不碰再收回换边。" },
